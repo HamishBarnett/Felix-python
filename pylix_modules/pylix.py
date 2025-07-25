@@ -12,6 +12,7 @@ import struct
 from pylix_modules import pylix_dicts as fu
 
 
+
 def read_inp_file(filename):
     """
     Reads in the file felix.inp and assigns values based on text labels.
@@ -56,7 +57,9 @@ def read_hkl_file(filename):
     Parameters:
     filename (str): The path to the input file.
     Returns:
-    input_hkls, i_obs, sigma_obs
+    input_hkls (ndarray): Array of Miller indices.
+    i_obs (ndarray or None): Observed intensities if cRED, else None.
+    sigma_obs (ndarray or None): Standard deviations if cRED, else None.
     """
     input_hkls = []
     i_obs = []
@@ -78,7 +81,7 @@ def read_hkl_file(filename):
                 parts = line.split()
 
                 # Extract Miller indices
-                g_ = list(parts[0:3])
+                g_ = [int(val) for val in parts[0:3]]
                 input_hkls.append(g_)
 
                 if cRED:  # Extract g, i_obs and sigma_obs
@@ -116,7 +119,10 @@ def extract_cif_parameter(item):
         # If no uncertainty is provided, return zero pm
         value_str = item
         pm_str = None
-    value = float(value_str)
+    try:
+        value = float(value_str)
+    except ValueError:
+        raise ValueError(f"Could not convert CIF parameter '{item}' to float.")
 
     # uncertainty
     if pm_str:
@@ -228,13 +234,10 @@ def read_cif(filename):
             del cif_dict[key]
 
     # tidy up cell parameters that have been read as lists not tuples
-    # I feel there should be a more elegant way of fixing this issue!
-    if isinstance(cif_dict['cell_length_a'], list):
-        cif_dict['cell_length_a'] = cif_dict['cell_length_a'][0]
-    if isinstance(cif_dict['cell_length_b'], list):
-        cif_dict['cell_length_b'] = cif_dict['cell_length_b'][0]
-    if isinstance(cif_dict['cell_length_a'], list):
-        cif_dict['cell_length_c'] = cif_dict['cell_length_c'][0]
+    for key in ['cell_length_a', 'cell_length_b', 'cell_length_c']:
+        if key in cif_dict and isinstance(cif_dict[key], list):
+            cif_dict[key] = cif_dict[key][0]
+
 
     # tidy up chemical formula
     if "chemical_formula_structural" in cif_dict:
@@ -258,41 +261,73 @@ def read_cif(filename):
 
 
 def symop_convert(symop_xyz):
-    """ Converts symmetry operation xyz form into matrix+vector form.
+    """
+    Converts symmetry operations in string form (e.g. 'x+1/2,y,z')
+    into matrix (rotation) and vector (translation) components.
+
     We expect the input symop_xyz to be a list of strings describing symops.
     Each string should consist of three parts, comma delimited.
     Each part should have a direction x, y or z and (optional)
-    a translation expressed as a fraction of integers (with values <= 6)."""
-    symmetry_count = len(symop_xyz)
+    a translation expressed as a fraction of integers (with values <= 6).
+
+    Parameters:
+    - symop_xyz: list of strings
+        Each string is a symmetry operation in 'x,y,z' format with
+        optional integer or fractional translations.
+
+    Returns:
+    - mat: ndarray (n_symops x 3 x 3)
+        Rotation matrices for each symmetry operation.
+    - vec: ndarray (n_symops x 3)
+        Translation vectors corresponding to each rotation.
+    """
+
+    symmetry_count = len(symop_xyz)  # Number of symmetry operations
+
+    # Initialise empty arrays for matrices and vectors
     mat = np.zeros((symmetry_count, 3, 3), dtype="float")
     vec = np.zeros((symmetry_count, 3), dtype="float")
+
+    # Map for identifying coordinate axes
     coord_map = {'x': 0, 'y': 1, 'z': 2}
-    # we expect comma-delimited symmetry operations
+
     for i in range(symmetry_count):
-        symop = symop_xyz[i]
-        # Remove any numbers, extra spaces, and quotation marks
-        symop = re.sub(r'^[\s\'\"]*', '', symop).replace("'", "").replace('"', '').strip()
-        # split into 3 parts
+        # Clean up the symmetry operation string
+        symop = symop_xyz[i].strip().replace("'", "").replace('"', "").replace(" ", "")
+        
+        # Split into components for x, y, z directions
         parts = symop.split(',')
+        if len(parts) != 3:
+            raise ValueError(f"Invalid symmetry operation: '{symop}'")
+
+        # Loop over the 3 parts (x, y, z)
         for j, pt in enumerate(parts):
-            # Regex to capture the k/l/m (x, y, z) and the fractional part
+            # -------------------------
+            # 1. Parse the rotational (directional) component (e.g. -x, y, z)
             match = re.search(r'([+-]?[xyz])', pt)
             if match:
-                # Extract the variable part (x, y, z)
                 var_part = match.group()
-                if var_part:
-                    pm1 = -1 if var_part.startswith('-') else 1
-                    axis = coord_map[var_part[-1]]
-                    mat[i, j, axis] = pm1
-                else:
-                    raise ValueError('.cif read: Error in reading symops')
-            match = re.search(r'([+-]?\d+/\d+)', pt)
-            if match:
-                # Extract the fractional part
-                frac_part = match.group()
-                if frac_part:
-                    numerator, denominator = map(int, frac_part.split('/'))
-                    vec[i, j] = numerator / denominator
+                pm1 = -1 if var_part.startswith('-') else 1  # Sign of direction
+                axis = coord_map[var_part[-1]]               # x→0, y→1, z→2
+                mat[i, j, axis] = pm1                         # Set matrix component
+            else:
+                raise ValueError(f"Missing x/y/z in symop part: '{pt}' (symop #{i+1})")
+
+            # -------------------------
+            # 2. Parse fractional translation (e.g. +1/2)
+            frac_matches = re.findall(r'([+-]?\d+/\d+)', pt)
+            if len(frac_matches) > 1:
+                raise ValueError(f"Too many fractions in symop part: '{pt}'")
+            elif len(frac_matches) == 1:
+                numerator, denominator = map(int, frac_matches[0].split('/'))
+                vec[i, j] = numerator / denominator
+
+            # -------------------------
+            # 3. Support integer translations (e.g. +1)
+            elif vec[i, j] == 0.0:
+                int_match = re.search(r'([+-]?\d+)(?!/)', pt)
+                if int_match:
+                    vec[i, j] = int(int_match.group())
 
     return mat, vec
 
@@ -323,7 +358,7 @@ def unique_atom_positions(symmetry_matrix, symmetry_vector, basis_atom_label,
     n_basis_atoms = basis_atom_position.shape[0]
     total_atoms = n_symmetry_operations * n_basis_atoms
 
-    # Initialize arrays to store all atom positions, including duplicates
+    # Initialise arrays to store all atom positions, including duplicates
     all_atom_label = np.tile(basis_atom_label, n_symmetry_operations)
     all_atom_name = np.tile(basis_atom_name, n_symmetry_operations)
     all_occupancy = np.tile(basis_occupancy, n_symmetry_operations)
@@ -335,7 +370,7 @@ def unique_atom_positions(symmetry_matrix, symmetry_vector, basis_atom_label,
         symmetry_vector[:, np.newaxis, :]
     all_atom_position = symmetry_applied.reshape(total_atoms, 3)
 
-    # Normalize positions to be within [0, 1]
+    # Normalise positions to be within [0, 1]
     all_atom_position %= 1.0
     # make small values precisely zero
     all_atom_position[np.abs(all_atom_position) < tol] = 0.0
@@ -500,23 +535,21 @@ def reference_frames(debug, cell_a, cell_b, cell_c, cell_alpha, cell_beta,
                          np.cos(cell_beta) * np.cos(cell_gamma)) /
         np.sin(cell_gamma)])
 
-    # Some checks for rhombohedral cells
-    # if diffraction_flag == 0:
-    #     r_test = (
-    #         np.dot(a_vec_o / np.dot(a_vec_o, a_vec_o),
-    #                b_vec_o / np.dot(b_vec_o, b_vec_o)) *
-    #         np.dot(b_vec_o / np.dot(b_vec_o, b_vec_o),
-    #                c_vec_o / np.dot(c_vec_o, c_vec_o)) *
-    #         np.dot(c_vec_o / np.dot(c_vec_o, c_vec_o),
-    #                a_vec_o / np.dot(a_vec_o, a_vec_o))
-    #     )
-    #     if 'r' in space_group.lower():
-    #         if abs(r_test) < tiny:
-    #             space_group = "V"
-    #             # Assume the crystal is Obverse
-    #         else:
-    #             space_group = "P"
-    #             # Primitive setting (Rhombohedral axes)
+    # Handle rhombohedral settings (tentative check)
+    if "r" in space_group.lower():
+        r_test = (
+            np.dot(a_vec_o / np.dot(a_vec_o, a_vec_o),
+                   b_vec_o / np.dot(b_vec_o, b_vec_o)) *
+            np.dot(b_vec_o / np.dot(b_vec_o, b_vec_o),
+                   c_vec_o / np.dot(c_vec_o, c_vec_o)) *
+            np.dot(c_vec_o / np.dot(c_vec_o, c_vec_o),
+                   a_vec_o / np.dot(a_vec_o, a_vec_o))
+        )
+        if abs(r_test) < tiny:
+            print("→ Rhombohedral setting detected: likely *obverse* hexagonal axes.")
+        else:
+            print("→ Rhombohedral setting detected: likely *primitive* rhombohedral axes.")
+
 
     # Reciprocal lattice vectors: orthogonal frame in 1/Angstrom units
     ar_vec_o = (2.0*np.pi * np.cross(b_vec_o, c_vec_o) /
@@ -533,9 +566,15 @@ def reference_frames(debug, cell_a, cell_b, cell_c, cell_alpha, cell_beta,
 
     # Initial unit X and Z vectors in orthogonal frame
     x_dir_o = t_cr2or @ x_dir_c
-    x_dir_o /= np.linalg.norm(x_dir_o)
+    norm_x = np.linalg.norm(x_dir_o)
+    if norm_x < tiny:
+        raise ValueError("x_dir_c maps to a zero vector. Check input directions.")
+    x_dir_o /= norm_x
     z_dir_o = t_c2o @ z_dir_c
-    z_dir_o /= np.linalg.norm(z_dir_o)
+    norm_z = np.linalg.norm(z_dir_o)
+    if norm_z < tiny:
+        raise ValueError("z_dir_c maps to a zero vector. Check input directions.")
+    z_dir_o /= norm_z
     # orthogonality check (< 0.1 degree, cos(90-0.1)=0.001475)
     if abs(np.dot(x_dir_o, z_dir_o)) > np.cos(89.9*np.pi/180.):
         raise ValueError("x and z directions are not orthogonal!")
@@ -565,9 +604,9 @@ def reference_frames(debug, cell_a, cell_b, cell_c, cell_alpha, cell_beta,
         print(f"X = {x_dir_c} (reciprocal space)")
         print(f"Z = {z_dir_c} (direct space)")
         print(" ")
-        print("Transformation crystal to orthogonal (O) frame:")
+        print("Direct lattice → Orthogonal frame:")
         print(t_c2o)
-        print("Transformation crystal to orthogonal (O) frame, reciprocal space:")
+        print("Reciprocal lattice → Orthogonal frame:")
         print(t_cr2or)
         print(f"O frame: a = {a_vec_o}, b = {b_vec_o}, c = {c_vec_o}")
         print(f"a* = {ar_vec_o}, b* = {br_vec_o}, c* = {cr_vec_o}")
@@ -585,34 +624,42 @@ def change_origin(space_group, basis_atom_position, basis_wyckoff):
 
     Parameters:
     space_group (int): The space group number.
+    basis_atom_position (ndarray): Fractional coordinates of basis atoms.
+    basis_wyckoff (list of str): Wyckoff labels for the basis atoms.
 
     Returns:
-    basis_atom_position (ndarray): the updated basis atom fractional coords.
+    ndarray: Updated fractional coordinates.
     """
-    change_flag = 0
-    n_basis_atoms = basis_atom_position.shape[0]  # Number of basis atoms
 
-    # Only needed for space group #142 (I41/acd) so far
-    # will be needed for others with origin choices!!!
-    if space_group == 142:
-        # Change from choice 1 (origin -4 at [0,0,0])
-        # to choice 2 (origin -1 at [0,0,0])
-        # Look for an 'a' site incompatible with choice 2
-        for i in range(n_basis_atoms):
-            # 'a' is -4 at [000],[0,1/2,1/2],[0,1/2,1/4],[1/2,0,1/4] in 1
-            # and [0,1/4,3/8], [0,3/4,5/8], [1/2,1/4,5/8], [1/2,3/4,5/8] in 2
-            if basis_wyckoff[i] == 'a':
-                # Check for origin 1
-                # by multiplying by 4 and checking if it is an integer
-                if np.mod(4 * basis_atom_position[i, 2], 1.0) < 1e-10:
-                    change_flag = 1
-        # add [0,1/4,3/8] if change_flag is set
-        if change_flag == 1:
-            basis_atom_position[:, 1] = np.mod(basis_atom_position[:, 1]
-                                               + 0.25, 1.0)
-            basis_atom_position[:, 2] = np.mod(basis_atom_position[:, 2]
-                                               + 0.375, 1.0)
-    return basis_atom_position
+    # Define origin shifts by space group (extendable)
+    origin_shifts = {
+        142: {
+            "wyckoff_check": "a",
+            "shift_vector": np.array([0.0, 0.25, 0.375]),
+            "z_check_multiple": 4  # 4*z should be integer for choice 1
+        },
+        # Future extension: add other space groups here
+    }
+
+    if space_group not in origin_shifts:
+        return basis_atom_position  # No change needed
+
+    shift_info = origin_shifts[space_group]
+    n_atoms = basis_atom_position.shape[0]
+    change_flag = False
+
+    for i in range(n_atoms):
+        if basis_wyckoff[i].lower() == shift_info["wyckoff_check"]:
+            z_mult = shift_info["z_check_multiple"]
+            if np.mod(z_mult * basis_atom_position[i, 2], 1.0) < 1e-10:
+                change_flag = True
+                break
+
+    if change_flag:
+        new_positions = np.mod(basis_atom_position + shift_info["shift_vector"], 1.0)
+        return new_positions
+    else:
+        return basis_atom_position
 
 
 def preferred_basis(space_group, basis_atom_position, basis_wyckoff):

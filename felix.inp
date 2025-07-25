@@ -32,6 +32,10 @@ accelerating_voltage_kv   = 200.0
 frame_angle               = 0.1035
 n_frames                  = 250
 
+# Rocking curve shape (for kinematic simulation)
+rc_fwhm                  = 0.04     # Full Width at Half Max of RC in Å⁻¹
+ds_limit                 = 0.15     # sg deviation threshold
+
 # Image output options
 initial_thickness         = 1850.0
 final_thickness           = 1850.0
@@ -57,3 +61,5 @@ refinement_scale          = 0.05
 exit_criteria             = 0.0001
 debug                     = 0
 plot                      = 1
+
+dm3_path = 'path/to/your/dm3/folder'

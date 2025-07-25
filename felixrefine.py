@@ -14,6 +14,13 @@ import matplotlib.colors as mcolors
 import time
 from scipy.constants import c, h, e, m_e, angstrom
 
+import logging
+
+logging.basicConfig(
+    level=logging.INFO,  # Or logging.DEBUG for more detail
+    format="%(asctime)s - %(levelname)s - %(message)s"
+)
+
 # felix modules
 from pylix_modules import pylix as px
 from pylix_modules import simulate as sim
@@ -37,172 +44,195 @@ v.iter_count = 0
 
 # %% read felix.cif
 
-# cif_dict is a dictionary of value-key pairs.  values are given as tuples
-# with the second number the uncertainty in the first.  Nothing is currently
-# done with these uncertainties...
+# Read CIF file and extract dictionary
 cif_dict = px.read_cif('felix.cif')
 v.update_from_dict(cif_dict)
-# ====== extract cif data into working variables v
+
+# Extract chemical formula
 v.space_group = v.symmetry_space_group_name_h_m
-if v.chemical_formula_structural is not None:
+if v.chemical_formula_structural:
     v.chemical_formula = v.chemical_formula_structural
-elif v.chemical_formula_sum is not None:
+elif v.chemical_formula_sum:
     v.chemical_formula = v.chemical_formula_sum
-elif v.chemical_formula_iupac is not None:
+elif v.chemical_formula_iupac:
     v.chemical_formula = v.chemical_formula_iupac
-print("Material: " + v.chemical_formula)
-
-# space group number and lattice type
-if "space_group_symbol" in cif_dict:
-    v.space_group = v.space_group_symbol.replace(' ', '')
-elif "space_group_name_h_m_alt" in cif_dict:
-    v.space_group = v.space_group_name_h_m_alt.replace(' ', '')
-elif "symmetry_space_group_name_h_m" in cif_dict:
-    v.space_group = v.symmetry_space_group_name_h_m.replace(' ', '')
-elif "space_group_it_number" in cif_dict:
-    v.space_group_number = int(v.space_group_it_number[0])
-    reverse_space_groups = {v: k for k, v in fu.space_groups.items()}
-    v.space_group = reverse_space_groups.get(v.space_group_number, "Unknown")
 else:
-    error_flag = True
-    raise ValueError("No space group found in .cif")
-v.lattice_type = v.space_group[0]
-v.space_group_number = fu.space_groups[v.space_group]
+    v.chemical_formula = "Unknown"
+print("Material:", v.chemical_formula)
 
-# cell
+# Retrieve space group and number
+space_group_keys = [
+    "space_group_symbol",
+    "space_group_name_h_m_alt",
+    "symmetry_space_group_name_h_m"
+]
+for key in space_group_keys:
+    if key in cif_dict:
+        v.space_group = cif_dict[key].replace(" ", "")
+        break
+
+# Ensure space group number
+if "space_group_it_number" in cif_dict:
+    v.space_group_number = int(cif_dict["space_group_it_number"][0])
+elif v.space_group in fu.space_groups:
+    v.space_group_number = fu.space_groups[v.space_group]
+else:
+    raise ValueError("Unable to determine space group number from .cif")
+
+# Determine lattice type
+v.lattice_type = v.space_group[0]
+
+# === Cell parameters ===
 v.cell_a = v.cell_length_a[0]
 v.cell_b = v.cell_length_b[0]
 v.cell_c = v.cell_length_c[0]
-v.cell_alpha = v.cell_angle_alpha[0]*np.pi/180.0  # angles in radians
-v.cell_beta = v.cell_angle_beta[0]*np.pi/180.0
-v.cell_gamma = v.cell_angle_gamma[0]*np.pi/180.0
+v.cell_alpha = v.cell_angle_alpha[0] * np.pi / 180.0  # convert to radians
+v.cell_beta  = v.cell_angle_beta[0]  * np.pi / 180.0
+v.cell_gamma = v.cell_angle_gamma[0] * np.pi / 180.0
+
 n_basis = len(v.atom_site_label)
 
-# symmetry operations
+# === Symmetry operations ===
 if "space_group_symop_operation_xyz" in cif_dict:
-    v.symmetry_matrix, v.symmetry_vector = px.symop_convert(
-        v.space_group_symop_operation_xyz)
+    sym_ops = cif_dict["space_group_symop_operation_xyz"]
 elif "symmetry_equiv_pos_as_xyz" in cif_dict:
-    v.symmetry_matrix, v.symmetry_vector = px.symop_convert(
-        v.symmetry_equiv_pos_as_xyz)
+    sym_ops = cif_dict["symmetry_equiv_pos_as_xyz"]
 else:
-    error_flag = True
     raise ValueError("Symmetry operations not found in .cif")
 
-# extract the basis from the raw cif values
-# take basis atom labels as given
+v.symmetry_matrix, v.symmetry_vector = px.symop_convert(sym_ops)
+
+# === Atom labels and names ===
 v.basis_atom_label = v.atom_site_label
-# atom symbols, stripping any charge etc.
-v.basis_atom_name = [''.join(filter(str.isalpha, name))
-                     for name in v.atom_site_type_symbol]
-# take care of any odd symbols, get the case right
-for i in range(n_basis):
-    name = v.basis_atom_name[i]
-    if len(name) == 1:
-        name = name.upper()
-    elif len(name) > 1:
-        name = name[0].upper() + name[1:].lower()
-    v.basis_atom_name[i] = name
-# take basis Wyckoff letters as given (maybe check they are only letters?)
+
+def clean_element_name(raw):
+    name = ''.join(filter(str.isalpha, raw))
+    return name.capitalize() if name else "X"
+
+v.basis_atom_name = [clean_element_name(n) for n in v.atom_site_type_symbol]
+
+# === Wyckoff symbols ===
 v.basis_wyckoff = v.atom_site_wyckoff_symbol
+# Optional: check they are valid characters
+for w in v.basis_wyckoff:
+    if not w.isalpha():
+        raise ValueError(f"Invalid Wyckoff symbol: {w}")
 
-# basis_atom_position = np.zeros([basis_count, 3])
-v.basis_atom_position = \
-    np.column_stack((np.array([tup[0] for tup in v.atom_site_fract_x]),
-                     np.array([tup[0] for tup in v.atom_site_fract_y]),
-                     np.array([tup[0] for tup in v.atom_site_fract_z])))
+# === Basis positions (fractional coordinates) ===
+v.basis_atom_position = np.column_stack([
+    np.array([val[0] for val in v.atom_site_fract_x]),
+    np.array([val[0] for val in v.atom_site_fract_y]),
+    np.array([val[0] for val in v.atom_site_fract_z])
+])
 
-# Debye-Waller factor
+# === Debye-Waller factors (B_iso or U_iso) ===
 if "atom_site_b_iso_or_equiv" in cif_dict:
-    v.basis_B_iso = np.array([tup[0] for tup in v.atom_site_b_iso_or_equiv])
+    v.basis_B_iso = np.array([val[0] for val in v.atom_site_b_iso_or_equiv])
 elif "atom_site_u_iso_or_equiv" in cif_dict:
-    v.basis_B_iso = np.array([tup[0] for tup in
-                              v.atom_site_u_iso_or_equiv])*8*(np.pi**2)
-
-# occupancy, assume it's unity if not specified
-if v.atom_site_occupancy is not None:
-    v.basis_occupancy = np.array([tup[0] for tup in v.atom_site_occupancy])
+    v.basis_B_iso = np.array([val[0] for val in cif_dict["atom_site_u_iso_or_equiv"]]) * 8 * np.pi**2
 else:
-    v.basis_occupancy = np.ones([n_basis])
+    v.basis_B_iso = np.zeros(n_basis)
 
-v.basis_atom_delta = np.zeros([n_basis, 3])  # ***********what's this
+# === Occupancy ===
+if v.atom_site_occupancy is not None:
+    v.basis_occupancy = np.array([val[0] for val in v.atom_site_occupancy])
+else:
+    v.basis_occupancy = np.ones(n_basis)
+
+# === Initialise basis_atom_delta for coordinate refinement ===
+v.basis_atom_delta = np.zeros([n_basis, 3])
 
 
-# %% read felix.inp
+# %% read felix.inp and initialise
+
 inp_dict = px.read_inp_file('felix.inp')
 v.update_from_dict(inp_dict)
 
-# thickness array
-if (v.final_thickness > v.initial_thickness + v.delta_thickness):
-    v.thickness = np.arange(v.initial_thickness, v.final_thickness,
-                            v.delta_thickness)
+# --- Thickness array setup ---
+if v.final_thickness > v.initial_thickness + v.delta_thickness:
+    v.thickness = np.arange(v.initial_thickness, v.final_thickness, v.delta_thickness)
     v.n_thickness = len(v.thickness)
 else:
-    # redefine a single value to be a list [] so it's iterable
+    # redefine a single value to be a list [] so that it is iterable
     v.thickness = [v.initial_thickness]
     v.n_thickness = 1
 
-# convert arrays to numpy
+# --- Convert important inputs to numpy arrays ---
 v.incident_beam_direction = np.array(v.incident_beam_direction, dtype='float')
 v.normal_direction = np.array(v.normal_direction, dtype='float')
 v.x_direction = np.array(v.x_direction, dtype='float')
 v.atomic_sites = np.array(v.atomic_sites, dtype='int')
 
-# set up absorption if needed
+# --- Absorption setup ---
 if v.absorption_method != 1:
     v.absorption_per = 0.0
 
-# crystallography exp(2*pi*i*g.r) to physics convention exp(i*g.r)
+# --- Reciprocal space limits ---
 v.frame_g_limit *= 2 * np.pi
-# *** temporary definition of frame resolution A^-1/pixel ***
-v.frame_resolution =  (v.frame_size_x//2) / v.frame_g_limit
 v.g_limit *= 2 * np.pi
 
-# output
+# --- Frame resolution: use more descriptive name and check validity ---
+if v.frame_g_limit > 0:
+    v.frame_resolution = (v.frame_size_x // 2) / v.frame_g_limit  # A^-1/pixel
+else:
+    raise ValueError("Invalid frame_g_limit; cannot calculate frame resolution.")
+
+# === Output basic simulation info ===
 print(f"Initial orientation: {v.incident_beam_direction.astype(int)}")
 print(f"{v.n_frames} frames, each integrating over {v.frame_angle} degrees")
 if v.frame_output == 1:
     print("Will output kinematic frame simulation")
+
 if v.n_thickness == 1:
-    print(f"Specimen thickness {v.initial_thickness/10} nm")
+    print(f"Specimen thickness {v.initial_thickness / 10:.1f} nm")
 else:
-    print(f"{v.n_thickness} thicknesses: {', '.join(map(str, v.thickness/10))} nm")
+    thickness_str = ', '.join(map(lambda t: f"{t/10:.1f}", v.thickness))
+    print(f"{v.n_thickness} thicknesses: {thickness_str} nm")
 
-if v.scatter_factor_method == 0:
-    print("Using Kirkland scattering factors")
-elif v.scatter_factor_method == 1:
-    print("Using Lobato scattering factors")
-elif v.scatter_factor_method == 2:
-    print("Using Peng scattering factors")
-elif v.scatter_factor_method == 3:
-    print("Using Doyle & Turner scattering factors")
+# --- Scattering factor method ---
+scatter_method_names = {
+    0: "Kirkland",
+    1: "Lobato",
+    2: "Peng",
+    3: "Doyle & Turner"
+}
+method_name = scatter_method_names.get(v.scatter_factor_method)
+if method_name:
+    print(f"Using {method_name} scattering factors")
 else:
-    raise ValueError("No scattering factors chosen in felix.inp")
+    raise ValueError("No valid scattering factor method selected in felix.inp")
 
-if 'S' in v.refine_mode:
-    print("Simulation only, S")
-elif 'A' in v.refine_mode:
+# --- Refinement mode setup ---
+invalid_combination = False
+if 'A' in v.refine_mode:
     print("Refining Structure Factors, A")
-    # needs error check for any other refinement
-    # raise ValueError("Structure factor refinement
-    # incompatible with anything else")
+    # Structure factor refinement cannot be combined with others
+    other_modes = [m for m in v.refine_mode if m not in ('A', 'S')]
+    if other_modes:
+        raise ValueError(f"Refinement mode 'A' cannot be combined with other modes: {other_modes}")
+elif 'S' in v.refine_mode:
+    print("Simulation only, S")
 else:
+    # All other refinement types
     if 'B' in v.refine_mode:
         print("Refining Atomic Coordinates, B")
-        # redefine the basis if necessary to allow coordinate refinement
-        v.basis_atom_position = px.preferred_basis(v.space_group_number,
-                                                   v.basis_atom_position,
-                                                   v.basis_wyckoff)
+        try:
+            v.basis_atom_position = px.preferred_basis(
+                v.space_group_number, v.basis_atom_position, v.basis_wyckoff)
+        except Exception as err:
+            logging.warning(f"Could not compute preferred basis: {err}")
+            raise ValueError(f"Could not compute preferred basis: {err}")
+
     if 'C' in v.refine_mode:
         print("Refining Occupancies, C")
     if 'D' in v.refine_mode:
         print("Refining Isotropic Debye Waller Factors, D")
     if 'E' in v.refine_mode:
-        print("Refining Anisotropic Debye Waller Factors, E")
-        raise ValueError("Refinement mode E not implemented")
-    if (len(v.atomic_sites) > n_basis):
-        raise ValueError("Number of atomic sites to refine is larger than the \
-                         number of atoms")
+        raise ValueError("Refinement mode E (anisotropic Debye-Waller) not yet implemented")
+    if len(v.atomic_sites) > n_basis:
+        raise ValueError("Number of atomic sites to refine exceeds number of basis atoms")
+
+# These refinement modes are not mutually exclusive
 if 'F' in v.refine_mode:
     print("Refining Lattice Parameters, F")
 if 'G' in v.refine_mode:
@@ -213,9 +243,20 @@ if 'I' in v.refine_mode:
     print("Refining Accelerating Voltage, I")
 
 
+
 # %% read felix.hkl
 v.input_hkls, v.i_obs, v.sigma_obs = px.read_hkl_file("felix.hkl")
-v.n_out = len(v.input_hkls)+1  # we expect 000 NOT to be in the hkl list
+
+# Ensure 000 is not in the list — remove if present
+zero_hkl = [0, 0, 0]
+if any(np.array_equal(hkl, zero_hkl) for hkl in v.input_hkls):
+    print("Warning: (0,0,0) reflection found in felix.hkl and will be ignored.")
+    idx_to_keep = [not np.array_equal(hkl, zero_hkl) for hkl in v.input_hkls]
+    v.input_hkls = [hkl for hkl, keep in zip(v.input_hkls, idx_to_keep) if keep]
+    v.i_obs = [i for i, keep in zip(v.i_obs, idx_to_keep) if keep]
+    v.sigma_obs = [s for s, keep in zip(v.sigma_obs, idx_to_keep) if keep]
+
+v.n_out = len(v.input_hkls) + 1  # Account for simulated 000
 
 
 # %% Setup kV and unit cell
@@ -244,11 +285,14 @@ scatt_fac_to_volts = ((h**2) /
 # fill the unit cell and get mean inner potential
 # when iterating we only do it if necessary?
 # if v.iter_count == 0 or v.current_variable_type < 6:
-atom_position, atom_label, atom_name, B_iso, occupancy = \
-    px.unique_atom_positions(
-        v.symmetry_matrix, v.symmetry_vector, v.basis_atom_label,
-        v.basis_atom_name,
-        v.basis_atom_position, v.basis_B_iso, v.basis_occupancy)
+    
+if v.iter_count == 0 or v.current_variable_type < 6:
+    atom_position, atom_label, atom_name, B_iso, occupancy = \
+        px.unique_atom_positions(
+            v.symmetry_matrix, v.symmetry_vector, v.basis_atom_label,
+            v.basis_atom_name,
+            v.basis_atom_position, v.basis_B_iso, v.basis_occupancy)
+
 
 # Generate atomic numbers based on the elemental symbols
 atomic_number = np.array([fu.atomic_number_map[na] for na in atom_name])
@@ -314,10 +358,15 @@ t_m2o, t_c2o, t_cr2or = \
 print(f"Experimental resolution limit {0.5*v.frame_g_limit/np.pi:.3} reciprocal Angstroms")
 
 # Observable reflections are found within frame_g_limit
-# NB sine divisor is an attempt to expand range for non-rectilinear cells
-expand = np.min([np.sin(v.cell_alpha),
-                 np.sin(v.cell_beta), np.sin(v.cell_gamma)])
-g_limit = int(v.frame_g_limit/expand)
+# Adjust reciprocal space resolution to account for unit cell angle distortions
+# This ensures that even in low-symmetry cells (e.g., triclinic), 
+# all relevant g-vectors are still included
+min_sine = np.min([np.sin(v.cell_alpha),
+                   np.sin(v.cell_beta), np.sin(v.cell_gamma)])
+# Prevent division by zero in pathological cases (e.g. 0-degree angles)
+expand_factor = max(min_sine, 1e-4)
+g_limit = int(v.frame_g_limit / expand_factor)
+
 hkl_pool, g_pool, g_mag = px.hkl_make(t_cr2or, g_limit, v.lattice_type)
 n_g = len(g_mag)
 
@@ -344,14 +393,21 @@ sg = px.sg(big_k, g_pool)
 
 # we assume kinematic rocking curves are Gaussian in shape
 # with FWHM rc_fwhm, in reciprocal angstroms, when plotted against sg
-rc_fwhm = 0.04  # could be an input, but must be less than ds below!!!
-cc = (rc_fwhm/(2**1.5 * np.log(2)))**2  # term in gaussian denominator
 
+# === Rocking curve FWHM and deviation limit ===
+# Allow user to specify via felix.inp, else use defaults
+rc_fwhm = getattr(v, 'rc_fwhm', 0.04)  # reciprocal Ångstroms
+ds = getattr(v, 'ds_limit', 0.15)
 # The sg limit ds is used to determine whether a reflexion is in a frame
 # note that sg of 0.1 is a long way from the Bragg condition at 200kV
 # a value of 0.05 seems about right to match to experiment
-# could be an input or a multiple of rc_fwhm, but keep as a fixed value for now
-ds = 0.15
+
+# Ensure FWHM is less than the deviation limit (avoids unphysical RC)
+if rc_fwhm >= ds:
+    raise ValueError(f"rc_fwhm ({rc_fwhm}) must be smaller than ds_limit ({ds})")
+
+# Gaussian coefficient for rocking curve
+cc = (rc_fwhm / (2**1.5 * np.log(2)))**2
 
 # find all reflexions in all frames in the sg limit
 mask = np.abs(sg) < ds  # boolean, size [n_frames, n_g]
@@ -387,105 +443,138 @@ if v.frame_output == 1:
 
 # %% dynamical simulation
 
-I_dyn_frame = ([])
+I_dyn_frame = []
 for i in range(v.n_frames):
-    # i = 0
-    # g pool for this frame, reshaped as a list of g's to go into px.Fg
+    # g pool for this frame
     g_pool_f = g_pool_dyn[i].reshape(-1, 3)
-    g_mag_f = np.linalg.norm(g_pool_f, axis=1) + 1.0e-12  # their magnitudes
+    g_mag_f = np.linalg.norm(g_pool_f, axis=1) + 1.0e-12  # avoid division by 0
     sg_f = np.concatenate(([0], sg_frame[i]))  # sg's for first column of F_g matrix
-    ng_f = len(sg_f)  # F_g matrix is size [ng_f, ng_f]
+    ng_f = len(sg_f)
 
-    # if v.plot:
-    #     # show the beam pool for this frame
-    #     px.pool_plot(g_pool_f, g_mag_f)
+    # Show the beam pool? – perhaps comment out
+    if v.plot and v.debug > 1:
+        px.pool_plot(g_pool_f, g_mag_f)
 
     # structure factor Fg_matrix for this frame's g_pool
     # diagonal values depend on sg
-    Fg_matrix = px.Fg(g_pool_f, g_mag_f, atom_position, atomic_number,
-                      occupancy, v.scatter_factor_method, v.absorption_method,
-                      v.absorption_per, electron_velocity,
-                      B_iso).reshape(ng_f, ng_f)
+    Fg_matrix = px.Fg(
+        g_pool_f, g_mag_f, atom_position, atomic_number,
+        occupancy, v.scatter_factor_method, v.absorption_method,
+        v.absorption_per, electron_velocity, B_iso
+    ).reshape(ng_f, ng_f)
+
     # Conversion factor from F_g to U_g
     Fg_to_Ug = relativistic_correction / cell_volume
     ug_matrix = Fg_to_Ug * Fg_matrix
     # Spence's (1990) 'Structure matrix'
     # off-diagonal elements are Ug/2K, diagonal elements are Sg
-    ug_sg_matrix = 2.0*np.pi * ug_matrix / big_k_mag
-    # replace the diagonal with strong beam deviation parameters
-    ug_sg_matrix[np.arange(ng_f), np.arange(ng_f)] = sg_f
+    ug_sg_matrix = 2.0 * np.pi * ug_matrix / big_k_mag
+    np.fill_diagonal(ug_sg_matrix, sg_f)
+
+    # Print top-left of structure matrix? – perhaps comment out
     if v.debug:
         np.set_printoptions(precision=3, suppress=True)
-        print("Structure matrix")
-        print(ug_sg_matrix[:5, :5])
+        print(f"Structure matrix (frame {i+1}/{v.n_frames}):")
+        print(ug_sg_matrix[:min(5, ng_f), :min(5, ng_f)])
 
+    # Solve Bloch wave equation
     wave_functions = px.wave_functions(ug_sg_matrix, v.thickness, v.debug)
+
     # Dynamical intensities, discarding 000 so we have the same output length
     I_dyn_frame.append(np.squeeze(np.abs(wave_functions)**2)[1:])
+
 print("Dynamic simulation complete")
 
+# Plot dynamical frame output if requested
 log_scale = True
 if v.frame_output == 1:
-    px.frame_plot(t_m2o, g_frame_o, I_dyn_frame, v.n_frames, v.frame_size_x,
-                  v.frame_size_y, v.frame_resolution, log_scale)
+    px.frame_plot(
+        t_m2o, g_frame_o, I_dyn_frame,
+        v.n_frames, v.frame_size_x, v.frame_size_y,
+        v.frame_resolution, log_scale
+    )
 
 
 # %% Bragg position and rocking curves
+
 bragg = np.zeros_like(g_mag)
 for g in np.unique(np.concatenate(g_where)):
-    # Extract intensity for this g
-    I_kin_rc = np.squeeze([I_f[idx_list == g]
-                           for I_f, idx_list in zip(I_calc_frame, g_where)
-                           for idx, i in enumerate(idx_list) if i == g])
-    I_dyn_rc = np.squeeze([I_f[idx_list == g]
-                           for I_f, idx_list in zip(I_dyn_frame, g_where)
-                           for idx, i in enumerate(idx_list) if i == g])
-    sg_rc = np.squeeze([s_f[idx_list == g]
-                       for s_f, idx_list in zip(sg_frame, g_where)
-                       for idx, i in enumerate(idx_list) if i == g])
+    # Extract intensity for this reflection g across frames
+    I_kin_rc = np.squeeze([
+        I_f[idx_list == g]
+        for I_f, idx_list in zip(I_calc_frame, g_where)
+        for idx in range(len(idx_list)) if idx_list[idx] == g
+    ])
+    I_dyn_rc = np.squeeze([
+        I_f[idx_list == g]
+        for I_f, idx_list in zip(I_dyn_frame, g_where)
+        for idx in range(len(idx_list)) if idx_list[idx] == g
+    ])
+    sg_rc = np.squeeze([
+        s_f[idx_list == g]
+        for s_f, idx_list in zip(sg_frame, g_where)
+        for idx in range(len(idx_list)) if idx_list[idx] == g
+    ])
     f_rc = [i for i, indices in enumerate(g_where) if g in indices]
 
-    # get the position of sg = 0, sub-frame precision
+    # Estimate sub-frame Bragg position where sg crosses zero (Bragg condition)
+    if sg_rc.size < 2 or f_rc is None:
+        continue  # Not enough points to estimate
     if np.min(sg_rc) >= 0 or np.max(sg_rc) <= 0:
-        pass  # (skip iteration)
+        continue  # sg does not cross zero (no Bragg peak)
+
+    # Find last negative and first positive sg — use linear interpolation
+    neg = np.where(sg_rc < 0)[0][-1]   # Last occurrence of a -ve value
+    pos = np.where(sg_rc > 0)[0][0]    # First occurrence of a +ve value
+    sg_neg = sg_rc[neg]
+    sg_pos = sg_rc[pos]
+    frame_neg = f_rc[neg]
+    frame_pos = f_rc[pos]
+
+    # Linear interpolation to find Bragg position (sg = 0)
+    slope = sg_pos - sg_neg
+    if abs(slope) > 1e-12:  # Avoid division by 0
+        bragg[g] = frame_neg + abs(sg_neg) / abs(slope)
     else:
-        neg = np.where(sg_rc < 0)[0][-1]  # Last occurrence of a -ve value
-        pos = np.where(sg_rc > 0)[0][0]   # First occurrence of a +ve value
         # Compute ds/df
         # dsdf = sg_rc[pos] - sg_rc[neg]
         # Compute bragg position
-        bragg[g] = 0.5 * (f_rc[neg] + f_rc[pos]) + \
-            (sg_rc[neg]+sg_rc[pos]) / (abs(sg_rc[neg])+abs(sg_rc[pos]))
+        bragg[g] = 0.5 * (frame_neg + frame_pos)  # Fallback: midpoint
 
+    # Plot rocking curves? – perhaps comment out
     if v.frame_output == 1:
         px.rock_plot(hkl_pool, g, sg_rc, f_rc, I_kin_rc, I_dyn_rc)
 
 
-# %% set up refinement
-# --------------------------------------------------------------------
+# %% Set up refinement
+
 # n_variables calculated depending upon Ug and non-Ug refinement
-# --------------------------------------------------------------------
 # Ug refinement is a special case, cannot do any other refinement alongside
 # We count the independent variables:
 # v.refined_variable = variable to be refined
 # v.refined_variable_type = what kind of variable, as follows
-# 0 = Ug amplitude
-# 1 = Ug phase
-# 2 = atom coordinate *** PARTIALLY IMPLEMENTED *** not all space groups
-# 3 = occupancy
-# 4 = B_iso
-# 5 = B_aniso *** NOT YET IMPLEMENTED ***
-# 61,62,63 = lattice parameters *** PARTIALLY IMPLEMENTED *** not rhombohedral
-# 7 = unit cell angles *** NOT YET IMPLEMENTED ***
-# 8 = convergence angle
-# 9 = accelerating_voltage_kv *** NOT YET IMPLEMENTED ***
-v.refined_variable = ([])
-v.refined_variable_type = ([])
-v.atom_refine_flag = ([])
+
+# 0 = Ug Amplitude
+# 1 = Ug Phase
+# 2 = Coordinate Refinement (*** PARTIALLY IMPLEMENTED *** not all space groups)
+# 3 = Occupancy Refinement
+# 4 = Isotropic Debye-Waller, B_iso
+# 5 = Anisotropic Debye-Waller, B_aniso (*** NOT YET IMPLEMENTED ***)
+# 61,62,63 = Lattice Parameters (*** PARTIALLY IMPLEMENTED *** not rhombohedral)
+# 7 = Unit Cell Angles (*** NOT YET IMPLEMENTED ***)
+# 8 = Convergence Angle
+# 9 = Accelerating Voltage, accelerating_voltage_kv (*** NOT YET IMPLEMENTED ***)
+
+v.refined_variable = []
+v.refined_variable_type = []
+v.atom_refine_flag = []
+
 if 'S' not in v.refine_mode:
     v.n_variables = 0
     # count refinement variables
-    if 'B' in v.refine_mode:  # Atom coordinate refinement
+
+    # --- Coordinate Refinement (2) --- (*** PARTIALLY IMPLEMENTED *** not all space groups)
+    if 'B' in v.refine_mode:
         for i in range(len(v.atomic_sites)):
             # the [3, 3] matrix 'moves' returned by atom_move gives the
             # allowed movements for an atom (depending on its Wyckoff
@@ -494,78 +583,78 @@ if 'S' not in v.refine_mode:
             moves = px.atom_move(v.space_group_number, v.basis_wyckoff[i])
             degrees_of_freedom = int(np.sum(moves**2))
             if degrees_of_freedom == 0:
-                raise ValueError("Atom coord refinement not possible")
+                raise ValueError(f"Atom coordinate refinement not supported for space group {v.space_group_number}")
             for j in range(degrees_of_freedom):
-                r_dot_v = np.dot(v.basis_atom_position[v.atomic_sites[i]],
-                                 moves[j, :])
+                r_dot_v = np.dot(v.basis_atom_position[v.atomic_sites[i]], moves[j, :])
                 v.refined_variable.append(r_dot_v)
                 v.refined_variable_type.append(2)
                 v.atom_refine_flag.append(v.atomic_sites[i])
 
-    if 'C' in v.refine_mode:  # Occupancy
+    # --- Occupancy Refinement (3) ---
+    if 'C' in v.refine_mode:
         for i in range(len(v.atomic_sites)):
             v.refined_variable.append(v.basis_occupancy[v.atomic_sites[i]])
             v.refined_variable_type.append(3)
             v.atom_refine_flag.append(v.atomic_sites[i])
 
-    if 'D' in v.refine_mode:  # Isotropic DW
+    # --- Isotropic Debye-Waller (4) ---
+    if 'D' in v.refine_mode:
         for i in range(len(v.atomic_sites)):
             v.refined_variable.append(v.basis_B_iso[v.atomic_sites[i]])
             v.refined_variable_type.append(4)
             v.atom_refine_flag.append(v.atomic_sites[i])
 
-    if 'E' in v.refine_mode:  # Anisotropic DW
-        # Not yet implemented!!! variable_type 5
-        raise ValueError("Anisotropic Debye-Waller factor refinement \
-                         not yet implemented")
+    # --- Anisotropic Debye-Waller (5) --- (*** NOT YET IMPLEMENTED ***)
+    if 'E' in v.refine_mode:
+        raise NotImplementedError("Refinement mode 'E' (Anisotropic Debye-Waller) is not supported in this version.")
 
-    if 'F' in v.refine_mode:  # Lattice parameters
+    # --- Lattice Parameters (6) --- (*** PARTIALLY IMPLEMENTED *** not rhombohedral)
+    if 'F' in v.refine_mode:
         # variable_type first digit=6 indicates lattice parameter
         # second digit=1,2,3 indicates a,b,c
         # This section needs work to include rhombohedral cells and
         # non-standard settings!!!
-        v.refined_variable.append(v.cell_a)  # is in all lattice types
+        v.refined_variable.append(v.cell_a) # is in all lattice types
         v.refined_variable_type.append(61)
-        v.atom_refine_flag.append(-1)  # -1 indicates not an atom
-        if v.space_group_number < 75:  # Triclinic, monoclinic, orthorhombic
-            v.refined_variable.append(v.cell_b)
-            v.refined_variable_type.append(62)
-            v.atom_refine_flag.append(-1)
-            v.refined_variable.append(v.cell_c)
-            v.refined_variable_type.append(63)
-            v.atom_refine_flag.append(-1)
-        elif 142 < v.space_group_number < 168:  # Rhombohedral
+        v.atom_refine_flag.append(-1) # -1 indicates not an atom
+
+        if v.space_group_number < 75: # Triclinic, monoclinic, orthorhombic
+            v.refined_variable += [v.cell_b, v.cell_c]
+            v.refined_variable_type += [62, 63]
+            v.atom_refine_flag += [-1, -1]
+
+        elif 142 < v.space_group_number < 168: # Rhombohedral
             # Need to work out R- vs H- settings!!!
-            raise ValueError("Rhombohedral R- vs H- not yet implemented")
-        elif (167 < v.space_group_number < 195) or \
-             (74 < v.space_group_number < 143):  # Hexagonal or Tetragonal
+            raise NotImplementedError("Refinement of rhombohedral cell dimensions (R vs H setting) is not supported.")
+
+        elif (74 < v.space_group_number < 143) or (v.space_group_number >= 168): # Hexagonal or Tetragonal
             v.refined_variable.append(v.cell_c)
             v.refined_variable_type.append(63)
             v.atom_refine_flag.append(-1)
 
-    if 'G' in v.refine_mode:  # Unit cell angles
-        # Not yet implemented!!! variable_type 7
-        raise ValueError("Unit cell angle refinement not yet implemented")
+    # --- Unit Cell Angles (7) --- (*** NOT YET IMPLEMENTED ***)
+    if 'G' in v.refine_mode:
+        raise NotImplementedError("Refinement of unit cell angles (G) is not implemented.")
 
-    if 'H' in v.refine_mode:  # Convergence angle
+    # --- Convergence Angle (8) ---
+    if 'H' in v.refine_mode:
         v.refined_variable.append(v.convergence_angle)
         v.refined_variable_type.append(8)
         v.atom_refine_flag.append(-1)
         print(f"Starting convergence angle {v.convergence_angle} Å^-1")
 
-    if 'I' in v.refine_mode:  # accelerating_voltage_kv
+    # --- Accelerating Voltage (9) --- (*** NOT YET IMPLEMENTED ***)
+    if 'I' in v.refine_mode:
         v.refined_variable.append(v.accelerating_voltage_kv)
         v.refined_variable_type.append(9)
         v.atom_refine_flag.append(-1)
 
-    # Total number of independent variables
+    # --- Final setup --- (Total number of independent variables)
     v.n_variables = len(v.refined_variable)
     if v.n_variables == 0:
-        raise ValueError("No refinement variables! \
-        Check refine_mode flag in felix.v. \
-            Valid refine modes are A,B,C,D,F,H,S")
-    if v.n_variables == 1:
-        print("Only one independent variable")
+        raise ValueError("No refinement variables specified. Check refine_mode in felix.inp.")
+    elif v.n_variables == 1:
+        print("Only one independent variable.")
     else:
         print(f"Number of independent variables = {v.n_variables}")
 
@@ -575,7 +664,7 @@ if 'S' not in v.refine_mode:
     v.refined_variable_atom = np.array(v.atom_refine_flag[:v.n_variables])
 
 
-# # %% set up Ug refinement
+# %% Set up Ug refinement
 # if 'A' in refine_mode:  # Ug refinement
 #     print("Refining Structure Factors, A")
 #     # needs error check for any other refinement
@@ -633,73 +722,93 @@ if 'S' not in v.refine_mode:
 #         j += 1
 
 
-# %% baseline simulation
+# %% Baseline simulation
 print("-------------------------------")
 print("Baseline simulation:")
-# uses the whole v=Var class
-setup, bwc = sim.simulate(v)
 
-# %% read in experimental images
+try:
+    # Run simulation using full input configuration
+    setup, bwc = sim.simulate(v)
+    print("Baseline simulation completed successfully.")
+except Exception as err:
+    print(f"Error during baseline simulation: {err}")
+    raise
+
+# %% Read in experimental images
 if 'S' not in v.refine_mode:
     v.lacbed_expt = np.zeros([2*v.image_radius, 2*v.image_radius, v.n_out])
-    # get the list of available images
     x_str = str(2*v.image_radius)
-    dm3_folder = None
-    for dirpath, dirnames, filenames in os.walk(path):
-        for dirname in dirnames:
-            # Check if 'dm3' and the number x are in the folder name
-            if 'dm3' in dirname.lower() and x_str in dirname:
-                # Return the full path of the matching folder
-                dm3_folder = os.path.join(dirpath, dirname)
-    if dm3_folder is not None:
-        dm3_files = [file for file in os.listdir(dm3_folder)
-                     if file.lower().endswith('.dm3')]
-        # just match the indices in the filename to felix.hkl, expect the user
-        # to ensure the data is of the right material!
-        n_expt = v.n_out
-        for i in range(v.n_out):
-            g_string = px.hkl_string(v.hkl[v.g_output[i]])
-            found = False
-            for file_name in dm3_files:
-                if g_string in file_name:
-                    file_path = os.path.join(dm3_folder, file_name)
-                    v.lacbed_expt[:, :, i] = px.read_dm3(file_path,
-                                                       2*v.image_radius,
-                                                       v.debug)
-                    found = True
-            if not found:
-                n_expt -= 1
-                print(f"{g_string} not found")
+    
+    # Optional override from felix.inp
+    dm3_folder = getattr(v, 'dm3_path', None)
 
-        # print experimental LACBED patterns
-        w = int(np.ceil(np.sqrt(v.n_out)))
-        h = int(np.ceil(v.n_out/w))
-        fig, axes = plt.subplots(w, h, figsize=(w*5, h*5))
-        text_effect = withStroke(linewidth=3, foreground='black')
-        axes = axes.flatten()
-        for i in range(v.n_out):
-            axes[i].imshow(v.lacbed_expt[:, :, i], cmap='gist_earth')
-            axes[i].axis('off')
-            annotation = f"{v.hkl[v.g_output[i], 0]}{v.hkl[v.g_output[i], 1]}{v.hkl[v.g_output[i], 2]}"
-            axes[i].annotate(annotation, xy=(5, 5), xycoords='axes pixels',
-                             size=30, color='w', path_effects=[text_effect])
-        for i in range(v.n_out, len(axes)):
-            axes[i].axis('off')
-        plt.tight_layout()
-        plt.show()
-        # initialise correlation
-        best_corr = np.ones(v.n_out)
+    if dm3_folder is None:
+        for dirpath, dirnames, filenames in os.walk(path):
+            for dirname in dirnames:
+                if 'dm3' in dirname.lower() and x_str in dirname:
+                    dm3_folder = os.path.join(dirpath, dirname)
+                    break
 
+    if dm3_folder is None or not os.path.exists(dm3_folder):
+        raise FileNotFoundError("No suitable .dm3 folder found. "
+                                "Make sure the folder name contains 'dm3' and "
+                                f"{x_str}, or set 'dm3_path' in felix.inp.")
+    
+    dm3_files = [file for file in os.listdir(dm3_folder)
+                 if file.lower().endswith('.dm3')]
 
-# %% output - *** needs work, apply blur/find best blur 
+    n_expt = v.n_out
+    found_count = 0
+    for i in range(v.n_out):
+        g_string = px.hkl_string(v.hkl[v.g_output[i]])
+        found = False
+        for file_name in dm3_files:
+            if g_string in file_name:
+                file_path = os.path.join(dm3_folder, file_name)
+                v.lacbed_expt[:, :, i] = px.read_dm3(file_path,
+                                                     2*v.image_radius,
+                                                     v.debug)
+                found = True
+                found_count += 1
+                break
+        if not found:
+            print(f"Warning: {g_string} not found in .dm3 folder")
+
+    print(f"Loaded {found_count} / {v.n_out} experimental images")
+
+    # Plot experimental patterns
+    w = int(np.ceil(np.sqrt(v.n_out)))
+    h = int(np.ceil(v.n_out / w))
+    fig, axes = plt.subplots(w, h, figsize=(w*5, h*5))
+    text_effect = withStroke(linewidth=3, foreground='black')
+    axes = axes.flatten()
+    for i in range(v.n_out):
+        axes[i].imshow(v.lacbed_expt[:, :, i], cmap='gist_earth')
+        axes[i].axis('off')
+        annotation = f"{v.hkl[v.g_output[i], 0]}{v.hkl[v.g_output[i], 1]}{v.hkl[v.g_output[i], 2]}"
+        axes[i].annotate(annotation, xy=(5, 5), xycoords='axes pixels',
+                         size=30, color='w', path_effects=[text_effect])
+    for i in range(v.n_out, len(axes)):
+        axes[i].axis('off')
+    plt.tight_layout()
+    plt.show()
+
+    best_corr = np.ones(v.n_out)  # Initialise correlation
+
+# %% output — apply blur to simulated LACBED patterns if requested
+from scipy.ndimage import gaussian_filter
+
 if v.image_processing == 1:
-    print(f"  Blur radius {v.blur_radius} pixels")
+    print(f"  Applying Gaussian blur: radius = {v.blur_radius} pixels")
+    if hasattr(v, 'lacbed_sim') and v.lacbed_sim is not None:
+        for i in range(v.lacbed_sim.shape[2]):
+            v.lacbed_sim[:, :, i] = gaussian_filter(v.lacbed_sim[:, :, i], sigma=v.blur_radius)
+    else:
+        print("Warning: No simulated LACBED data found to blur.")
+
 if 'S' in v.refine_mode:
-    #*** apply blur !!!
-    # output simulated LACBED patterns
     sim.print_LACBED(v)
 else:
-    # figure of merit
     fom = sim.figure_of_merit(v)
     print(f"  Figure of merit {100*fom:.2f}%")
     print("-------------------------------")
@@ -717,8 +826,10 @@ if 'S' not in v.refine_mode:
     df = 1.0
     r3_var = np.zeros(3)  # for parabolic minimum
     r3_fom = np.zeros(3)
-    # dunno what this is
-    independent_delta = 0.0
+    
+    # Initialise storage for uncertainty estimates (not yet implemented)
+    independent_delta = np.zeros(v.n_variables)
+
     
     # for a plot
     var_pl = ([])
@@ -793,6 +904,7 @@ if 'S' not in v.refine_mode:
             sim.print_current_var(v, v.refined_variable[i])
             # simulate
             setup, bwc = sim.simulate(v)
+            v.iter_count += 1
             # figure of merit
             fom = sim.figure_of_merit(v)
             if (fom < best_fit):
@@ -817,6 +929,7 @@ if 'S' not in v.refine_mode:
             sim.print_current_var(v, v.refined_variable[i])
             # simulate
             setup, bwc = sim.simulate(v)
+            v.iter_count += 1
             # figure of merit
             fom = sim.figure_of_merit(v)
             if (fom < best_fit):
@@ -838,7 +951,6 @@ if 'S' not in v.refine_mode:
                 p[i] = -(r3_fom[2] - r3_fom[0]) / (2 * dx)
                 # error estimate goes here
                 # independent_delta[i] = delta_x(r3_var, r3_fom, precision, err)
-                # uncert_brak(var_min, independent_delta[i])
     
         # ===========vector descent
         # either: point 1 of 3, or final simulation using the prediction next_var
@@ -846,6 +958,7 @@ if 'S' not in v.refine_mode:
         # simulation
         sim.update_variables(v)
         setup, bwc = sim.simulate(v)
+        v.iter_count += 1
         fom = sim.figure_of_merit(v)
         if (fom < best_fit):
             best_fit = fom*1.0
@@ -866,7 +979,7 @@ if 'S' not in v.refine_mode:
             print(f"Refining, refinement vector {p}")
             # Find index of the first non-zero element in the gradient vector
             # reset the refinement scale (last term reverses sign if we overshot)
-            p_mag = -best_var[j] * v.refinement_scale  #* (2*(fom < best_fit)-1)
+            p_mag = -best_var[j] * v.refinement_scale  
             # First of three points for concavity test is the best simulation
             r3_var[0] = best_var[j]*1.0
             r3_fom[0] = fom*1.0
@@ -880,6 +993,7 @@ if 'S' not in v.refine_mode:
             sim.print_current_var(v, v.refined_variable[j])
             sim.update_variables(v)
             setup, bwc = sim.simulate(v)
+            v.iter_count += 1
             fom = sim.figure_of_merit(v)
             if (fom < best_fit):
                 best_fit = fom*1.0
@@ -903,6 +1017,7 @@ if 'S' not in v.refine_mode:
             sim.print_current_var(v, v.refined_variable[j])
             sim.update_variables(v)
             setup, bwc = sim.simulate(v)
+            v.iter_count += 1
             fom = sim.figure_of_merit(v)
             if (fom < best_fit):
                 best_fit = fom*1.0
@@ -925,6 +1040,7 @@ if 'S' not in v.refine_mode:
                 sim.print_current_var(v, v.refined_variable[j])
                 sim.update_variables(v)
                 setup, bwc = sim.simulate(v)
+                v.iter_count += 1
                 fom = sim.figure_of_merit(v)
                 if (fom < best_fit):
                     best_fit = fom*1.0
@@ -952,9 +1068,15 @@ if 'S' not in v.refine_mode:
         v.refinement_scale *= (1 - 1 / (2 * v.n_variables))
         print(f"Improvement in fit {100*df:.2f}%, will stop at {100*v.exit_criteria:.2f}%")
         print("-------------------------------")
-        plt.plot(fit_pl)
-        # plt.scatter(var_pl, fit_pl)
+        plt.figure(figsize=(6, 4))
+        plt.plot(fit_pl, marker='o', linestyle='-')
+        plt.title("Figure of Merit over Iterations")
+        plt.xlabel("Iteration")
+        plt.ylabel("Figure of Merit (%)")
+        plt.grid(True)
+        plt.tight_layout()
         plt.show()
+
     
     print(f"Refinement complete after {v.iter_count} simulations.  Refined values: {best_var}")
 
@@ -995,3 +1117,30 @@ print("|||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||")
 # ani = animation.FuncAnimation(fig, update, frames=v.n_frames, interval=38.46, blit=False)
 # plt.show()
 # ani.save("animation.gif", writer="pillow", fps=26)
+
+
+# %% [Work in progress]: Animation of simulated frames (replace "JUNK ZONE")
+if hasattr(v, "frame_output") and v.frame_output == 1 and 'I_dyn_frame' in globals():
+    print("Creating animation from simulated LACBED frames...")
+
+    import matplotlib.animation as animation
+
+    fig, ax = plt.subplots()
+    ax.set_xticks([])
+    ax.set_yticks([])
+    frame_img = ax.imshow(np.zeros((v.frame_size_y, v.frame_size_x)),
+                          cmap='cividis', vmin=0, vmax=1.0)
+
+    def update(frame_idx):
+        frame = np.zeros((v.frame_size_y, v.frame_size_x))
+        if frame_idx < len(I_dyn_frame):
+            norm = np.max(I_dyn_frame[frame_idx])
+            if norm > 0:
+                frame = I_dyn_frame[frame_idx] / norm  # normalize per frame
+        frame_img.set_array(frame)
+        return [frame_img]
+
+    ani = animation.FuncAnimation(fig, update, frames=v.n_frames, interval=40, blit=False)
+    plt.show()
+    ani.save("simulation_animation.gif", writer="pillow", fps=25)
+    print("Animation saved as simulation_animation.gif")

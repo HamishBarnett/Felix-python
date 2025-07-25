@@ -117,6 +117,22 @@ def simulate(v):
 
     # ===============================================
 
+    # Create placeholder LACBED pattern: bright spots at center
+    # Purpose of this placeholder pattern is to test the "# %% output — apply blur..." 
+    # section in felixrefine.py
+    
+    from scipy.ndimage import gaussian_filter
+    
+    h, w = 2 * v.image_radius, 2 * v.image_radius
+    n_patterns = len(v.input_hkls) + 1
+    simulated_stack = np.zeros((h, w, n_patterns))
+    
+    for i in range(n_patterns):
+        simulated_stack[h//2, w//2, i] = 1.0  # bright spot in center
+        simulated_stack[:, :, i] = gaussian_filter(simulated_stack[:, :, i], sigma=4.0)
+    
+    v.lacbed_sim = simulated_stack
+
 
     return
 
