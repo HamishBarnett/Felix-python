@@ -114,10 +114,9 @@ v.basis_atom_name = [clean_element_name(n) for n in v.atom_site_type_symbol]
 # === Wyckoff symbols ===
 v.basis_wyckoff = v.atom_site_wyckoff_symbol
 # Optional: check they are valid characters
-if v.basis_wyckoff is not None:
-    for w in v.basis_wyckoff:
-        if not w.isalpha():
-            raise ValueError(f"Invalid Wyckoff symbol: {w}")
+for w in v.basis_wyckoff:
+    if not w.isalpha():
+        raise ValueError(f"Invalid Wyckoff symbol: {w}")
 
 # === Basis positions (fractional coordinates) ===
 v.basis_atom_position = np.column_stack([
