@@ -25,8 +25,8 @@ absorption_per            = 10.0
 
 # Microscope settings
 convergence_angle         = 0.1035
-incident_beam_direction   = [-23762, 100000, 38938]
-x_direction               = [5348, 40209, -100000]
+incident_beam_direction   = [1, 0, 0]
+x_direction               = [1, -2, 0]
 normal_direction          = [1, 0, -1]
 accelerating_voltage_kv   = 200.0
 frame_angle               = 0.1035
@@ -37,8 +37,8 @@ rc_fwhm                  = 0.04     # Full Width at Half Max of RC in Å⁻¹
 ds_limit                 = 0.15     # sg deviation threshold
 
 # Image output options
-initial_thickness         = 1850.0
-final_thickness           = 1850.0
+initial_thickness         = 500
+final_thickness           = 500
 delta_thickness           = 50.0
 precision                 = 0.00002
 frame_size_x			  = 1024
