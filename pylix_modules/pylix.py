@@ -110,15 +110,22 @@ def extract_cif_parameter(item):
     - tuple: A tuple containing the value and the uncertainty as floats.
     """
 
+    if isinstance(item, str):
+        item = item.strip()
+        if item in ('.', '?'):
+            # Return None for missing or unknown values
+            return None, None
+
     # Check if the value contains an uncertainty part (i.e., contains '(')
-    if '(' in item and ')' in item:
+    if isinstance(item, str) and '(' in item and ')' in item:
         value_str, pm_str = item.split('(')
         value_str = value_str.strip()  # Remove any extra spaces
-        pm_str = pm_str.strip(')')  # Remove the closing parenthesis
+        pm_str = pm_str.strip(')')     # Remove the closing parenthesis
     else:
         # If no uncertainty is provided, return zero pm
         value_str = item
         pm_str = None
+
     try:
         value = float(value_str)
     except ValueError:
@@ -128,6 +135,8 @@ def extract_cif_parameter(item):
     if pm_str:
         # Number of decimal places in the main value string
         decimal_places = value_str[::-1].find('.')
+        if decimal_places == -1:
+            decimal_places = 0
         pm = int(pm_str) * (10 ** -decimal_places)
     else:
         pm = 0
