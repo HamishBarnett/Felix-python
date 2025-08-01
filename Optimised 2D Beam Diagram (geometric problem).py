@@ -105,3 +105,4 @@ plt.show()
 # Output optimal shift
 print(f"Optimal horizontal shift to align yellow dots: {optimal_shift:.2f} units")
 print(f"Which corresponds to: {frames_shifted:.2f} frames")
+
