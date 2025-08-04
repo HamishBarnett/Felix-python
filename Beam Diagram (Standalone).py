@@ -67,16 +67,38 @@ def parse_pets_dyn_cif(filepath):
 
     # --- 4. Extract frame geometry from header
     details = block.find_value('_diffrn_measurement_details')
+    
+    print("\n--- Debug: Raw _diffrn_measurement_details contents ---")
+    print(details)
+    print("--- End Debug ---\n")
+    
     lines = details.split('\n')
+    print("Parsed lines from _diffrn_measurement_details:")
+    for line in lines:
+        print(f"  → {line}")
+    
     n_frames = None
     frame_step = None
+    
     for line in lines:
-        if 'number of merged frames' in line:
-            n_frames = int(line.split(':')[1].strip())
-        elif 'step between frames' in line:
-            frame_step = float(line.split(':')[1].strip())
+        line_stripped = line.strip().lower()
+        if 'number of merged frames' in line_stripped and ':' in line_stripped:
+            try:
+                value_str = line.rsplit(':', 1)[1].strip()
+                n_frames = int(value_str)
+            except ValueError:
+                print(f"Warning: Could not parse 'number of merged frames' from line: {line}")
+        elif 'step between frames' in line_stripped and ':' in line_stripped:
+            try:
+                value_str = line.rsplit(':', 1)[1].strip()
+                frame_step = float(value_str)
+            except ValueError:
+                print(f"Warning: Could not parse 'step between frames' from line: {line}")
+    
     if n_frames is None or frame_step is None:
-        raise ValueError("Could not find frame info in _diffrn_measurement_details")
+        print("Full measurement details text for debugging:")
+        print(details)
+        raise ValueError("Could not find valid frame info in _diffrn_measurement_details")
 
     # --- 5. Parse reflection loop
     refl_loop = block.find_loop('_refln_index_h')
