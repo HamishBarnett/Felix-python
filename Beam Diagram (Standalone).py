@@ -186,14 +186,14 @@ import numpy as np
 from pymatgen.core import Structure
 from itertools import product
 
-def generate_allowed_reflections(structure, d_min=0.01, hkl_limit=10):
+def generate_allowed_reflections(structure, d_min=0.0001, hkl_limit=10):
     """
     Generate allowed reciprocal lattice vectors g = h·a* + k·b* + l·c*
     within a given d-spacing threshold.
 
     Parameters:
         structure (pymatgen.Structure): The crystal structure object.
-        d_min (float): Minimum allowed d-spacing in Å (default: 0.01 Å).
+        d_min (float): Minimum allowed d-spacing in Å (default: 0.0001 Å).
         hkl_limit (int): Maximum |h|, |k|, |l| to search over (default: 10).
 
     Returns:
@@ -231,7 +231,7 @@ if __name__ == "__main__":
     # Load structure from CIF (as in Section A)
     structure = CifParser("silicon_structure.cif").get_structures()[0]
 
-    allowed_reflections = generate_allowed_reflections(structure, d_min=0.01, hkl_limit=8)
+    allowed_reflections = generate_allowed_reflections(structure, d_min=0.0001, hkl_limit=8)
 
     # Show sample output
     print("Sample allowed reflections:")
@@ -240,7 +240,7 @@ if __name__ == "__main__":
 
 import numpy as np
 
-def identify_bragg_reflections(reflections, wavelength, beam_direction=[0, 0, 1], tolerance=0.5):
+def identify_bragg_reflections(reflections, wavelength, beam_direction=[0, 0, 1], tolerance=50):
     """
     Identify which reflections satisfy the Bragg condition:
         2 * k0 · g ≈ |g|^2
@@ -283,7 +283,7 @@ if __name__ == "__main__":
     from pymatgen.io.cif import CifParser
 
     structure = CifParser("silicon_structure.cif").get_structures()[0]
-    reflections = generate_allowed_reflections(structure, d_min=0.01, hkl_limit=8)
+    reflections = generate_allowed_reflections(structure, d_min=0.0001, hkl_limit=8)
 
     # Wavelength of 200 keV electrons ≈ 0.02508 Å (as from your dyn.cif)
     wavelength = 0.02508
@@ -342,10 +342,10 @@ if __name__ == "__main__":
     from pymatgen.io.cif import CifParser
     
     structure = CifParser("silicon_structure.cif").parse_structures(primitive=True)[0]
-    allowed = generate_allowed_reflections(structure, d_min=0.01, hkl_limit=8)
+    allowed = generate_allowed_reflections(structure, d_min=0.0001, hkl_limit=8)
     
     # Increased tolerance to allow reasonable Bragg matches
-    bragg_refls = identify_bragg_reflections(allowed, wavelength=0.02508, beam_direction=[0,0,1], tolerance=0.5)
+    bragg_refls = identify_bragg_reflections(allowed, wavelength=0.02508, beam_direction=[0,0,1], tolerance=50)
     
     exit_waves = compute_exit_wavevectors(bragg_refls, wavelength=0.02508)
     
@@ -415,7 +415,7 @@ if __name__ == "__main__":
 
     # Load structure
     structure = CifParser("silicon_structure.cif").get_structures()[0]
-    allowed = generate_allowed_reflections(structure, d_min=0.01, hkl_limit=8)
+    allowed = generate_allowed_reflections(structure, d_min=0.0001, hkl_limit=8)
     bragg = identify_bragg_reflections(allowed, wavelength=0.02508)
     exit_waves = compute_exit_wavevectors(bragg, wavelength=0.02508)
 
@@ -442,7 +442,7 @@ def plot_beam_diagram(
     Parameters:
         projected_reflections (list): Output from gnomonic_projection.
         centroid_frames (dict): {hkl: frame number} from PETS dyn.cif.
-        frame_step (float): Degrees per frame (e.g., 0.001).
+        frame_step (float): Degrees per frame (e.g., 0.0001).
         beam_path_y (float): y-position of direct beam path (default: 0).
         title (str): Plot title.
     """
@@ -501,4 +501,83 @@ def plot_beam_diagram(
         beam_path_y=0,
         title="Simulated Beam Diagram (Initial Orientation)"
     )
+
+import numpy as np
+from scipy.optimize import minimize
+
+def apply_orientation_tilt(k0, alpha_deg, beta_deg):
+    """
+    Apply small tilts to the beam direction using α (around y) and β (around x).
+    Angles in degrees.
+    """
+    alpha = np.radians(alpha_deg)
+    beta = np.radians(beta_deg)
+
+    # Rotation matrices
+    R_alpha = np.array([
+        [np.cos(alpha), 0, np.sin(alpha)],
+        [0, 1, 0],
+        [-np.sin(alpha), 0, np.cos(alpha)]
+    ])
+
+    R_beta = np.array([
+        [1, 0, 0],
+        [0, np.cos(beta), -np.sin(beta)],
+        [0, np.sin(beta), np.cos(beta)]
+    ])
+
+    k0_new = R_beta @ R_alpha @ k0
+    return k0_new / np.linalg.norm(k0_new)
+
+def compute_alignment_error(alpha_beta, reflections, structure, wavelength, centroid_frames, frame_step):
+    """
+    Cost function for optimization: RMS vertical distance of yellow dots to red beam path.
+    """
+    alpha, beta = alpha_beta
+    k0_tilted = apply_orientation_tilt(np.array([0, 0, 1]), alpha, beta)
+
+
+    allowed = generate_allowed_reflections(structure, d_min=0.0001, hkl_limit=8)
+    bragg = identify_bragg_reflections(allowed, wavelength, beam_direction=k0_tilted)
+    exit_waves = compute_exit_wavevectors(bragg, wavelength, beam_direction=k0_tilted)
+    projected = gnomonic_projection(exit_waves, proj_plane_normal=[0, 0, 1])
+
+    # Match yellow dots: for each reflection that has both centroid and projection
+    errors = []
+    for refl in projected:
+        hkl = refl['hkl']
+        if hkl in centroid_frames:
+            x = centroid_frames[hkl] * frame_step
+            y = refl['projected_2d'][1]  # y-deviation from beam path
+            errors.append(y**2)
+
+    rms_error = np.sqrt(np.mean(errors)) if errors else 1e6  # fallback
+    return rms_error
+
+def refine_orientation(structure, wavelength, centroid_frames, frame_step):
+    """
+    Optimize α and β to align experimental reflection peaks with beam path.
+    """
+    print(" Refining orientation (α, β)...")
+    result = minimize(
+        compute_alignment_error,
+        x0=[0.0, 0.0],  # initial guess: α = 0, β = 0
+        args=(None, structure, wavelength, centroid_frames, frame_step),
+        method='Powell',
+        options={'maxiter': 100, 'disp': True}
+    )
+
+    print(f" Optimal α = {result.x[0]:.4f}°, β = {result.x[1]:.4f}°")
+    return result.x  # [alpha_deg, beta_deg]
+
+
+from pymatgen.io.cif import CifParser
+
+structure = CifParser("silicon_structure.cif").get_structures()[0]
+wavelength = 0.02508  # from your PETS dyn.cif
+centroid_frames = dyn_data['centroid_frames']
+frame_step = dyn_data['frame_step']
+
+
+alpha_opt, beta_opt = refine_orientation(structure, wavelength, centroid_frames, frame_step)
 
