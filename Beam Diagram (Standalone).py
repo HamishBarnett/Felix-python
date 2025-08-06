@@ -30,7 +30,7 @@ def parse_structure_cif(cif_path):
     for site in structure.sites:
         atom_positions.append({
             'element': site.species_string,
-            'frac_coords': list(site.frac_coords)
+            'frac_coords': [float(x) for x in site.frac_coords]
         })
 
     # Print summary
@@ -49,7 +49,7 @@ def parse_structure_cif(cif_path):
 
 # Example usage:
 if __name__ == "__main__":
-    cif_file = "silicon_structure.cif"  # Replace with actual path
+    cif_file = "silicon_structure.cif"  # Replace with path
     data = parse_structure_cif(cif_file)
 
     # Access output
@@ -58,106 +58,113 @@ if __name__ == "__main__":
     atom_sites = data['atom_positions']
 
 
-import gemmi
+import re
 from collections import defaultdict
 import numpy as np
 
-def parse_pets_dyn_cif(cif_path):
+def parse_dyn_cif_manual(filepath):
     """
-    Parse a PETS .dyn.cif file and extract geometry and reflection data.
-
-    Parameters:
-        cif_path (str): Path to the .dyn.cif file.
-
-    Returns:
-        dict: {
-            'unit_cell': (a, b, c, alpha, beta, gamma),
-            'wavelength': float,
-            'UB_matrix': 3x3 numpy array,
-            'frame_step': float (deg/frame),
-            'n_frames': int,
-            'reflection_profiles': { (h,k,l): [ (frame, intensity), ... ] },
-            'centroid_frames': { (h,k,l): centroid_frame (float) }
-        }
+    Manually parse PETS dyn.cif without using gemmi.
+    Extracts unit cell, wavelength, UB matrix, frame step, and reflection intensities.
     """
-    doc = gemmi.cif.read_file(cif_path)
-    block = doc.sole_block()
+    with open(filepath, 'r') as f:
+        lines = f.readlines()
 
-    # --- Unit cell
-    a = float(block.find_value('_cell_length_a'))
-    b = float(block.find_value('_cell_length_b'))
-    c = float(block.find_value('_cell_length_c'))
-    alpha = float(block.find_value('_cell_angle_alpha'))
-    beta = float(block.find_value('_cell_angle_beta'))
-    gamma = float(block.find_value('_cell_angle_gamma'))
-    unit_cell = (a, b, c, alpha, beta, gamma)
-
-    # --- Wavelength
-    wavelength = float(block.find_value('_diffrn_radiation_wavelength'))
-
-    # --- UB matrix
-    UB = np.array([
-        [float(block.find_value('_diffrn_orient_matrix_UB_11')),
-         float(block.find_value('_diffrn_orient_matrix_UB_12')),
-         float(block.find_value('_diffrn_orient_matrix_UB_13'))],
-        [float(block.find_value('_diffrn_orient_matrix_UB_21')),
-         float(block.find_value('_diffrn_orient_matrix_UB_22')),
-         float(block.find_value('_diffrn_orient_matrix_UB_23'))],
-        [float(block.find_value('_diffrn_orient_matrix_UB_31')),
-         float(block.find_value('_diffrn_orient_matrix_UB_32')),
-         float(block.find_value('_diffrn_orient_matrix_UB_33'))]
-    ])
-
-    # --- Frame step and frame count from _diffrn_measurement_details
-    details = block.find_value('_diffrn_measurement_details')
+    unit_cell = {}
+    UB = np.zeros((3, 3))
+    wavelength = None
     frame_step = None
     n_frames = None
-    for line in details.split('\n'):
-        if 'step between frames' in line:
-            frame_step = float(line.split(':')[-1].strip())
-        elif 'number of merged frames' in line:
-            n_frames = int(line.split(':')[-1].strip())
-    if frame_step is None or n_frames is None:
-        raise ValueError("Could not extract frame step or frame count.")
+    reflections = []
 
-    # --- Parse reflection data loop
-    loop = block.find_loop('_refln_index_h')
-    tags = loop.tags
-    idx = {tag: i for i, tag in enumerate(tags)}
+    in_loop = False
+    loop_tags = []
+    data_rows = []
 
-    h_idx = idx['_refln_index_h']
-    k_idx = idx['_refln_index_k']
-    l_idx = idx['_refln_index_l']
-    I_idx = idx['_refln_intensity_meas']
-    frame_idx = idx.get('_refln_zone_axis_id')  # typically holds frame index
+    for i, line in enumerate(lines):
+        line = line.strip()
 
+        # --- Unit cell
+        if line.startswith('_cell_length_a'):
+            unit_cell['a'] = float(line.split()[1])
+        elif line.startswith('_cell_length_b'):
+            unit_cell['b'] = float(line.split()[1])
+        elif line.startswith('_cell_length_c'):
+            unit_cell['c'] = float(line.split()[1])
+        elif line.startswith('_cell_angle_alpha'):
+            unit_cell['alpha'] = float(line.split()[1])
+        elif line.startswith('_cell_angle_beta'):
+            unit_cell['beta'] = float(line.split()[1])
+        elif line.startswith('_cell_angle_gamma'):
+            unit_cell['gamma'] = float(line.split()[1])
+
+        # --- Wavelength
+        elif line.startswith('_diffrn_radiation_wavelength'):
+            wavelength = float(line.split()[1])
+
+        # --- UB matrix
+        elif '_diffrn_orient_matrix_UB_' in line:
+            parts = line.split()
+            idx = int(re.search(r'UB_(\d)(\d)', line).group(1)) - 1
+            jdx = int(re.search(r'UB_(\d)(\d)', line).group(2)) - 1
+            UB[idx][jdx] = float(parts[1])
+
+        # --- Measurement details
+        elif '_diffrn_measurement_details' in line:
+            j = i + 1
+            while j < len(lines) and not lines[j].startswith('_'):
+                if 'step between frames' in lines[j]:
+                    frame_step = float(lines[j].split(':')[-1].strip())
+                elif 'number of merged frames' in lines[j]:
+                    n_frames = int(lines[j].split(':')[-1].strip())
+                j += 1
+
+        # --- Start of reflection loop
+        elif line.startswith('loop_') and '_refln_index_h' in lines[i+1]:
+            in_loop = True
+            loop_tags = []
+            data_rows = []
+
+        elif in_loop:
+            if line.startswith('_'):
+                loop_tags.append(line)
+            elif line.strip() == '':
+                continue
+            elif line.startswith('data_'):
+                in_loop = False
+            else:
+                data_rows.append(line.strip().split())
+
+    # --- Parse reflection data
+    tag_map = {tag: idx for idx, tag in enumerate(loop_tags)}
     reflection_profiles = defaultdict(list)
-    for row in loop:
+    for row in data_rows:
         try:
-            h = int(row[h_idx])
-            k = int(row[k_idx])
-            l = int(row[l_idx])
-            intensity = float(row[I_idx])
-            frame = int(row[frame_idx]) if frame_idx is not None else 0
-            if intensity > 0:
-                reflection_profiles[(h, k, l)].append((frame, intensity))
+            h = int(row[tag_map['_refln_index_h']])
+            k = int(row[tag_map['_refln_index_k']])
+            l = int(row[tag_map['_refln_index_l']])
+            I = float(row[tag_map['_refln_intensity_meas']])
+            frame = int(row[tag_map['_refln_zone_axis_id']])
+            reflection_profiles[(h, k, l)].append((frame, I))
         except Exception:
-            continue  # skip malformed rows
+            continue  # skip malformed lines
 
-    # --- Compute centroid frame (sub-frame precision)
+    # --- Compute centroid frames
     centroid_frames = {}
-    for hkl, data in reflection_profiles.items():
-        frames = np.array([f for f, _ in data])
-        intensities = np.array([I for _, I in data])
+    for hkl, values in reflection_profiles.items():
+        frames = np.array([f for f, _ in values])
+        intensities = np.array([i for _, i in values])
         if intensities.sum() == 0:
-            centroid = np.mean(frames)
+            centroid = frames.mean()
         else:
             centroid = np.sum(frames * intensities) / np.sum(intensities)
         centroid_frames[hkl] = centroid
 
-    # --- Final return
     return {
-        'unit_cell': unit_cell,
+        'unit_cell': (
+            unit_cell['a'], unit_cell['b'], unit_cell['c'],
+            unit_cell['alpha'], unit_cell['beta'], unit_cell['gamma']
+        ),
         'wavelength': wavelength,
         'UB_matrix': UB,
         'frame_step': frame_step,
@@ -166,20 +173,13 @@ def parse_pets_dyn_cif(cif_path):
         'centroid_frames': centroid_frames
     }
 
-# Example usage
-if __name__ == "__main__":
-    cif_file = "Si_3_dyn.cif_pets"  # Replace with your actual file
-    data = parse_pets_dyn_cif(cif_file)
+dyn_data = parse_dyn_cif_manual("Si_3_dyn.cif_pets")
 
-    print("  Parsed PETS .dyn.cif successfully")
-    print("  Unit cell:", data['unit_cell'])
-    print("  Wavelength:", data['wavelength'])
-    print("  Frame step (deg):", data['frame_step'])
-    print("  UB matrix:\n", data['UB_matrix'])
-    print("  Total reflections:", len(data['reflection_profiles']))
-    print("  Sample centroid frames:")
-    for hkl, cf in list(data['centroid_frames'].items())[:5]:
-        print(f"    {hkl} → centroid frame = {cf:.2f}")
+print("Unit cell:", dyn_data['unit_cell'])
+print("Wavelength:", dyn_data['wavelength'])
+print("UB matrix:\n", dyn_data['UB_matrix'])
+print("Frame step:", dyn_data['frame_step'])
+print("Reflections parsed:", len(dyn_data['reflection_profiles']))
 
 
 import numpy as np
