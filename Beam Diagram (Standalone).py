@@ -186,14 +186,14 @@ import numpy as np
 from pymatgen.core import Structure
 from itertools import product
 
-def generate_allowed_reflections(structure, d_min=0.0001, hkl_limit=10):
+def generate_allowed_reflections(structure, d_min=0.001, hkl_limit=10):
     """
     Generate allowed reciprocal lattice vectors g = h·a* + k·b* + l·c*
     within a given d-spacing threshold.
 
     Parameters:
         structure (pymatgen.Structure): The crystal structure object.
-        d_min (float): Minimum allowed d-spacing in Å (default: 0.0001 Å).
+        d_min (float): Minimum allowed d-spacing in Å (default: 0.001 Å).
         hkl_limit (int): Maximum |h|, |k|, |l| to search over (default: 10).
 
     Returns:
@@ -231,7 +231,7 @@ if __name__ == "__main__":
     # Load structure from CIF (as in Section A)
     structure = CifParser("silicon_structure.cif").get_structures()[0]
 
-    allowed_reflections = generate_allowed_reflections(structure, d_min=0.0001, hkl_limit=8)
+    allowed_reflections = generate_allowed_reflections(structure, d_min=0.001, hkl_limit=8)
 
     # Show sample output
     print("Sample allowed reflections:")
@@ -283,7 +283,7 @@ if __name__ == "__main__":
     from pymatgen.io.cif import CifParser
 
     structure = CifParser("silicon_structure.cif").get_structures()[0]
-    reflections = generate_allowed_reflections(structure, d_min=0.0001, hkl_limit=8)
+    reflections = generate_allowed_reflections(structure, d_min=0.001, hkl_limit=8)
 
     # Wavelength of 200 keV electrons ≈ 0.02508 Å (as from your dyn.cif)
     wavelength = 0.02508
@@ -342,7 +342,7 @@ if __name__ == "__main__":
     from pymatgen.io.cif import CifParser
     
     structure = CifParser("silicon_structure.cif").parse_structures(primitive=True)[0]
-    allowed = generate_allowed_reflections(structure, d_min=0.0001, hkl_limit=8)
+    allowed = generate_allowed_reflections(structure, d_min=0.001, hkl_limit=8)
     
     # Increased tolerance to allow reasonable Bragg matches
     bragg_refls = identify_bragg_reflections(allowed, wavelength=0.02508, beam_direction=[0,0,1], tolerance=50)
@@ -415,7 +415,7 @@ if __name__ == "__main__":
 
     # Load structure
     structure = CifParser("silicon_structure.cif").get_structures()[0]
-    allowed = generate_allowed_reflections(structure, d_min=0.0001, hkl_limit=8)
+    allowed = generate_allowed_reflections(structure, d_min=0.001, hkl_limit=8)
     bragg = identify_bragg_reflections(allowed, wavelength=0.02508)
     exit_waves = compute_exit_wavevectors(bragg, wavelength=0.02508)
 
@@ -537,7 +537,7 @@ def compute_alignment_error(alpha_beta, reflections, structure, wavelength, cent
     k0_tilted = apply_orientation_tilt(np.array([0, 0, 1]), alpha, beta)
 
 
-    allowed = generate_allowed_reflections(structure, d_min=0.0001, hkl_limit=8)
+    allowed = generate_allowed_reflections(structure, d_min=0.001, hkl_limit=8)
     bragg = identify_bragg_reflections(allowed, wavelength, beam_direction=k0_tilted)
     exit_waves = compute_exit_wavevectors(bragg, wavelength, beam_direction=k0_tilted)
     projected = gnomonic_projection(exit_waves, proj_plane_normal=[0, 0, 1])
@@ -581,3 +581,109 @@ frame_step = dyn_data['frame_step']
 
 alpha_opt, beta_opt = refine_orientation(structure, wavelength, centroid_frames, frame_step)
 
+
+import numpy as np
+from pymatgen.core.structure import Structure, Molecule
+from pymatgen.core.lattice import Lattice
+from scipy.optimize import minimize
+
+def apply_lattice_to_structure(original_structure, a, b, c, alpha, beta, gamma):
+    """
+    Create a new Structure with updated lattice parameters but same atomic positions.
+    """
+    new_lattice = Lattice.from_parameters(a, b, c, alpha, beta, gamma)
+    frac_coords = [site.frac_coords for site in original_structure]
+    species = [site.specie for site in original_structure]
+    return Structure(new_lattice, species, frac_coords)
+
+def compute_lattice_misalignment_error(lattice_params, structure, wavelength, centroid_frames, frame_step, k0_tilted):
+    """
+    Cost function to minimize misalignment with respect to beam path by adjusting lattice parameters.
+    """
+    a, b, c, alpha, beta, gamma = lattice_params
+    temp_structure = apply_lattice_to_structure(structure, a, b, c, alpha, beta, gamma)
+
+
+    allowed = generate_allowed_reflections(temp_structure, d_min=0.001, hkl_limit=8)
+    bragg = identify_bragg_reflections(allowed, wavelength, beam_direction=k0_tilted)
+    exit_waves = compute_exit_wavevectors(bragg, wavelength, beam_direction=k0_tilted)
+    projected = gnomonic_projection(exit_waves, proj_plane_normal=[0, 0, 1])
+
+    # Compute yellow dot error
+    errors = []
+    for refl in projected:
+        hkl = refl['hkl']
+        if hkl in centroid_frames:
+            x = centroid_frames[hkl] * frame_step
+            y = refl['projected_2d'][1]
+            errors.append(y**2)
+
+    return np.sqrt(np.mean(errors)) if errors else 1e6
+
+def refine_lattice_parameters(structure, wavelength, centroid_frames, frame_step, k0_tilted):
+    """
+    Optimize lattice parameters (a, b, c, α, β, γ) to minimize beam diagram misalignment.
+    """
+    print(" Refining lattice parameters...")
+
+    # Initial parameters from structure
+    lat = structure.lattice
+    init_params = [lat.a, lat.b, lat.c, lat.alpha, lat.beta, lat.gamma]
+
+    bounds = [
+        (0.9 * lat.a, 1.1 * lat.a),
+        (0.9 * lat.b, 1.1 * lat.b),
+        (0.9 * lat.c, 1.1 * lat.c),
+        (85, 95),  # alpha
+        (85, 95),  # beta
+        (85, 95)   # gamma
+    ]
+
+    result = minimize(
+        compute_lattice_misalignment_error,
+        x0=init_params,
+        args=(structure, wavelength, centroid_frames, frame_step, k0_tilted),
+        method='Powell',
+        bounds=bounds,
+        options={'maxiter': 100, 'disp': True}
+    )
+
+    a, b, c, alpha, beta, gamma = result.x
+    print(f" Optimized lattice: a={a:.4f}, b={b:.4f}, c={c:.4f}, "
+          f"α={alpha:.2f}, β={beta:.2f}, γ={gamma:.2f}")
+    return result.x  # tuple of refined lattice parameters
+
+from pymatgen.io.cif import CifParser
+
+structure = CifParser("silicon_structure.cif").get_structures()[0]
+wavelength = 0.02508
+centroid_frames = dyn_data['centroid_frames']
+frame_step = dyn_data['frame_step']
+
+# Step 1: Optimize beam tilt (α and β)
+optimal_alpha_beta = refine_orientation(
+    structure,
+    wavelength,
+    centroid_frames,
+    frame_step
+)
+
+alpha_deg, beta_deg = optimal_alpha_beta  # Use optimized values
+
+# Step 2: Compute tilted beam direction
+k0_tilted = apply_orientation_tilt([0, 0, 1], alpha_deg, beta_deg)
+
+# Step 3: Refine lattice using this beam direction
+refined_params = refine_lattice_parameters(
+    structure,
+    wavelength,
+    centroid_frames,
+    frame_step,
+    k0_tilted
+)
+
+print("\n=== Final Refinement Results ===")
+print(f"Beam orientation tilt: α = {alpha_deg:.4f}°, β = {beta_deg:.4f}°")
+print(f"Lattice parameters: a = {refined_params[0]:.4f}, b = {refined_params[1]:.4f}, "
+      f"c = {refined_params[2]:.4f}, α = {refined_params[3]:.2f}, β = {refined_params[4]:.2f}, γ = {refined_params[5]:.2f}")
+print("Refined unit cell volume:", Lattice.from_parameters(*refined_params).volume)
