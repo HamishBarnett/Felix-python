@@ -186,14 +186,14 @@ import numpy as np
 from pymatgen.core import Structure
 from itertools import product
 
-def generate_allowed_reflections(structure, d_min=0.5, hkl_limit=10):
+def generate_allowed_reflections(structure, d_min=0.01, hkl_limit=10):
     """
     Generate allowed reciprocal lattice vectors g = h·a* + k·b* + l·c*
     within a given d-spacing threshold.
 
     Parameters:
         structure (pymatgen.Structure): The crystal structure object.
-        d_min (float): Minimum allowed d-spacing in Å (default: 0.5 Å).
+        d_min (float): Minimum allowed d-spacing in Å (default: 0.01 Å).
         hkl_limit (int): Maximum |h|, |k|, |l| to search over (default: 10).
 
     Returns:
@@ -231,9 +231,125 @@ if __name__ == "__main__":
     # Load structure from CIF (as in Section A)
     structure = CifParser("silicon_structure.cif").get_structures()[0]
 
-    allowed_reflections = generate_allowed_reflections(structure, d_min=0.5, hkl_limit=8)
+    allowed_reflections = generate_allowed_reflections(structure, d_min=0.01, hkl_limit=8)
 
     # Show sample output
     print("Sample allowed reflections:")
     for r in allowed_reflections[:5]:
         print(f"  hkl = {r['hkl']}, |g| = {r['g_len']:.3f} Å⁻¹, d = {r['d_spacing']:.3f} Å")
+
+import numpy as np
+
+def identify_bragg_reflections(reflections, wavelength, beam_direction=[0, 0, 1], tolerance=0.5):
+    """
+    Identify which reflections satisfy the Bragg condition:
+        2 * k0 · g ≈ |g|^2
+
+    Parameters:
+        reflections (list): Output from Section C (each with hkl and g_cart)
+        wavelength (float): Electron wavelength in Å
+        beam_direction (list): Unit vector of incident beam (default [0, 0, 1])
+        tolerance (float): Max deviation from Bragg condition to accept (Å⁻²)
+
+    Returns:
+        list of dict: Each entry is {
+            'hkl': (h, k, l),
+            'g_cart': np.array,
+            'bragg_error': float (excitation error),
+        }
+    """
+    beam_unit = np.array(beam_direction) / np.linalg.norm(beam_direction)
+    k0 = beam_unit * (1 / wavelength)  # |k0| = 1 / λ
+
+    bragg_reflections = []
+
+    for refl in reflections:
+        g = refl['g_cart']
+        g_len_sq = np.dot(g, g)
+        two_k0_dot_g = 2 * np.dot(k0, g)
+        bragg_diff = abs(two_k0_dot_g - g_len_sq)
+        if bragg_diff < tolerance:
+            bragg_reflections.append({
+                'hkl': refl['hkl'],
+                'g_cart': g,
+                'bragg_error': two_k0_dot_g - g_len_sq
+            })
+
+    print(f" Found {len(bragg_reflections)} Bragg-allowed reflections within tolerance ±{tolerance}")
+    return bragg_reflections
+
+# Example usage
+if __name__ == "__main__":
+    from pymatgen.io.cif import CifParser
+
+    structure = CifParser("silicon_structure.cif").get_structures()[0]
+    reflections = generate_allowed_reflections(structure, d_min=0.01, hkl_limit=8)
+
+    # Wavelength of 200 keV electrons ≈ 0.02508 Å (as from your dyn.cif)
+    wavelength = 0.02508
+    bragg_refls = identify_bragg_reflections(reflections, wavelength)
+
+    print("Sample Bragg-allowed reflections:")
+    for b in bragg_refls[:5]:
+        print(f"  hkl = {b['hkl']}, Bragg error = {b['bragg_error']:.3e}")
+
+
+import numpy as np
+
+def compute_exit_wavevectors(bragg_reflections, wavelength, beam_direction=[0, 0, 1]):
+    """
+    For each Bragg-allowed reflection, compute the exit wavevector:
+        k_exit = k0 + g
+
+    Parameters:
+        bragg_reflections (list): Output from Section D, each with g_cart and hkl.
+        wavelength (float): Electron wavelength in Å.
+        beam_direction (list): Unit vector of incident beam direction (default [0, 0, 1]).
+
+    Returns:
+        list of dict: Each entry is {
+            'hkl': (h, k, l),
+            'g_cart': np.array,
+            'k_exit': np.array,
+            'k_dir': np.array (unit vector of k_exit)
+        }
+    """
+    k0_unit = np.array(beam_direction) / np.linalg.norm(beam_direction)
+    k0 = k0_unit * (1 / wavelength)
+
+    results = []
+    for refl in bragg_reflections:
+        g = refl['g_cart']
+        k_exit = k0 + g
+        k_dir = k_exit / np.linalg.norm(k_exit)
+
+        results.append({
+            'hkl': refl['hkl'],
+            'g_cart': g,
+            'k_exit': k_exit,
+            'k_dir': k_dir
+        })
+
+    print(f" Computed exit wavevectors for {len(results)} reflections.")
+    return results
+
+# Example usage
+if __name__ == "__main__":
+    # Assumes you've already run sections A–D and have `bragg_refls`
+    wavelength = 0.02508
+    beam_direction = [0, 0, 1]
+
+    from pymatgen.io.cif import CifParser
+    
+    structure = CifParser("silicon_structure.cif").parse_structures(primitive=True)[0]
+    allowed = generate_allowed_reflections(structure, d_min=0.01, hkl_limit=8)
+    
+    # Increased tolerance to allow reasonable Bragg matches
+    bragg_refls = identify_bragg_reflections(allowed, wavelength=0.02508, beam_direction=[0,0,1], tolerance=0.5)
+    
+    exit_waves = compute_exit_wavevectors(bragg_refls, wavelength=0.02508)
+    
+    for ew in exit_waves[:5]:
+        print(f"hkl = {ew['hkl']} → k_dir = {ew['k_dir']}")
+
+
