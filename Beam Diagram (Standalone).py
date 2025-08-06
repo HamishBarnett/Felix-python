@@ -353,3 +353,152 @@ if __name__ == "__main__":
         print(f"hkl = {ew['hkl']} → k_dir = {ew['k_dir']}")
 
 
+import numpy as np
+
+def gnomonic_projection(exit_wave_data, proj_plane_normal=[0, 0, 1]):
+    """
+    Apply gnomonic projection to exit wavevectors to convert them into 2D coordinates.
+
+    Parameters:
+        exit_wave_data (list): List of dicts from Section E, each with 'hkl' and 'k_dir'.
+        proj_plane_normal (list): Normal to projection plane (default: [0, 0, 1] → x–y plane).
+
+    Returns:
+        list of dicts: Each with {
+            'hkl': (h, k, l),
+            'projected_2d': (x_proj, y_proj),
+            'k_dir': np.array
+        }
+    """
+    normal = np.array(proj_plane_normal)
+    normal = normal / np.linalg.norm(normal)  # ensure unit vector
+
+    # Define two orthogonal vectors in the projection plane
+    if np.allclose(normal, [0, 0, 1]):
+        # If projecting onto x–y plane, use x and y
+        u = np.array([1, 0, 0])  # x-direction
+        v = np.array([0, 1, 0])  # y-direction
+    else:
+        # Generate orthonormal basis for arbitrary plane
+        u = np.cross([0, 1, 0], normal)
+        if np.linalg.norm(u) < 1e-6:
+            u = np.cross([1, 0, 0], normal)
+        u /= np.linalg.norm(u)
+        v = np.cross(normal, u)
+
+    projected_points = []
+
+    for refl in exit_wave_data:
+        k = refl['k_dir']
+        denom = np.dot(k, normal)
+        if denom <= 0:
+            continue  # Skip beams pointing away from the projection plane
+
+        scale = 1.0 / denom
+        intersect = scale * k  # projected intersection point on the plane
+
+        x_proj = np.dot(intersect, u)
+        y_proj = np.dot(intersect, v)
+
+        projected_points.append({
+            'hkl': refl['hkl'],
+            'projected_2d': (x_proj, y_proj),
+            'k_dir': k
+        })
+
+    print(f" Projected {len(projected_points)} reflections onto 2D plane.")
+    return projected_points
+
+# Example usage
+if __name__ == "__main__":
+    from pymatgen.io.cif import CifParser
+
+    # Load structure
+    structure = CifParser("silicon_structure.cif").get_structures()[0]
+    allowed = generate_allowed_reflections(structure, d_min=0.01, hkl_limit=8)
+    bragg = identify_bragg_reflections(allowed, wavelength=0.02508)
+    exit_waves = compute_exit_wavevectors(bragg, wavelength=0.02508)
+
+    projected = gnomonic_projection(exit_waves, proj_plane_normal=[0, 0, 1])
+
+    # Print a few projected points
+    for p in projected[:5]:
+        hkl = p['hkl']
+        x, y = p['projected_2d']
+        print(f"hkl = {hkl} → x' = {x:.3f}, y' = {y:.3f}")
+
+import matplotlib.pyplot as plt
+
+def plot_beam_diagram(
+    projected_reflections,
+    centroid_frames,
+    frame_step,
+    beam_path_y=0,
+    title="2D Beam Diagram"
+):
+    """
+    Plot the 2D beam diagram.
+
+    Parameters:
+        projected_reflections (list): Output from gnomonic_projection.
+        centroid_frames (dict): {hkl: frame number} from PETS dyn.cif.
+        frame_step (float): Degrees per frame (e.g., 0.001).
+        beam_path_y (float): y-position of direct beam path (default: 0).
+        title (str): Plot title.
+    """
+    fig, ax = plt.subplots(figsize=(12, 6))
+    ax.set_facecolor('black')
+
+    # Plot red line: beam path
+    x_vals = [cf * frame_step for cf in centroid_frames.values()]
+    ax.plot(
+        [min(x_vals), max(x_vals)],
+        [beam_path_y, beam_path_y],
+        color='red', linewidth=1.5, label='Beam Path (red)'
+    )
+
+    # White lines: Bragg condition traces (here plotted as points)
+    for refl in projected_reflections:
+        hkl = refl['hkl']
+        x = centroid_frames.get(hkl)
+        if x is not None:
+            x_proj = x * frame_step
+            y_proj = refl['projected_2d'][1]
+            ax.plot(x_proj, y_proj, 'w.', alpha=0.6)
+
+    # Blue vertical lines: frame positions
+    for hkl, frame in centroid_frames.items():
+        x_pos = frame * frame_step
+        ax.axvline(x_pos, color='blue', linestyle='--', linewidth=0.5, alpha=0.5)
+
+    # Yellow dots: intersection points (on beam path at centroid frame)
+    for refl in projected_reflections:
+        hkl = refl['hkl']
+        frame = centroid_frames.get(hkl)
+        if frame is not None:
+            x_pos = frame * frame_step
+            ax.plot(x_pos, beam_path_y, 'o', color='yellow', markersize=3)
+
+    ax.set_xlabel("Beam Tilt / Rotation (degrees)")
+    ax.set_ylabel("Reciprocal Space Projection (arb. units)")
+    ax.set_title(title)
+    ax.legend(loc='upper right', facecolor='black', framealpha=0.2, fontsize=8)
+    ax.set_xlim(min(x_vals), max(x_vals))
+    ax.grid(False)
+    plt.tight_layout()
+    plt.show()
+
+
+    # Assumes previous sections have provided these:
+    # projected = output from Section F
+    # centroid_frames = from Section B
+    # frame_step = from Section B (e.g., 0.001)
+    
+    plot_beam_diagram(
+        projected_reflections=projected,
+        centroid_frames=centroid_frames,
+        frame_step=0.001,
+        beam_path_y=0,
+        title="Simulated Beam Diagram (Initial Orientation)"
+    )
+
