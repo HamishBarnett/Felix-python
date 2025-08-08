@@ -186,7 +186,7 @@ import numpy as np
 from pymatgen.core import Structure
 from itertools import product
 
-def generate_allowed_reflections(structure, d_min=0.001, hkl_limit=10):
+def generate_allowed_reflections(structure, d_min=0.01, hkl_limit=10):
     """
     Generate allowed reciprocal lattice vectors g = h·a* + k·b* + l·c*
     within a given d-spacing threshold.
@@ -231,7 +231,7 @@ if __name__ == "__main__":
     # Load structure from CIF (as in Section A)
     structure = CifParser("silicon_structure.cif").get_structures()[0]
 
-    allowed_reflections = generate_allowed_reflections(structure, d_min=0.001, hkl_limit=8)
+    allowed_reflections = generate_allowed_reflections(structure, d_min=0.01, hkl_limit=8)
 
     # Show sample output
     print("Sample allowed reflections:")
@@ -240,7 +240,7 @@ if __name__ == "__main__":
 
 import numpy as np
 
-def identify_bragg_reflections(reflections, wavelength, beam_direction=[0, 0, 1], tolerance=50):
+def identify_bragg_reflections(reflections, wavelength, beam_direction=[0, 0, 1], tolerance=5):
     """
     Identify which reflections satisfy the Bragg condition:
         2 * k0 · g ≈ |g|^2
@@ -283,7 +283,7 @@ if __name__ == "__main__":
     from pymatgen.io.cif import CifParser
 
     structure = CifParser("silicon_structure.cif").get_structures()[0]
-    reflections = generate_allowed_reflections(structure, d_min=0.001, hkl_limit=8)
+    reflections = generate_allowed_reflections(structure, d_min=0.01, hkl_limit=8)
 
     # Wavelength of 200 keV electrons ≈ 0.02508 Å (as from your dyn.cif)
     wavelength = 0.02508
@@ -342,10 +342,10 @@ if __name__ == "__main__":
     from pymatgen.io.cif import CifParser
     
     structure = CifParser("silicon_structure.cif").parse_structures(primitive=True)[0]
-    allowed = generate_allowed_reflections(structure, d_min=0.001, hkl_limit=8)
+    allowed = generate_allowed_reflections(structure, d_min=0.01, hkl_limit=8)
     
     # Increased tolerance to allow reasonable Bragg matches
-    bragg_refls = identify_bragg_reflections(allowed, wavelength=0.02508, beam_direction=[0,0,1], tolerance=50)
+    bragg_refls = identify_bragg_reflections(allowed, wavelength=0.02508, beam_direction=[0,0,1], tolerance=5)
     
     exit_waves = compute_exit_wavevectors(bragg_refls, wavelength=0.02508)
     
@@ -415,7 +415,7 @@ if __name__ == "__main__":
 
     # Load structure
     structure = CifParser("silicon_structure.cif").get_structures()[0]
-    allowed = generate_allowed_reflections(structure, d_min=0.001, hkl_limit=8)
+    allowed = generate_allowed_reflections(structure, d_min=0.01, hkl_limit=8)
     bragg = identify_bragg_reflections(allowed, wavelength=0.02508)
     exit_waves = compute_exit_wavevectors(bragg, wavelength=0.02508)
 
@@ -537,7 +537,7 @@ def compute_alignment_error(alpha_beta, reflections, structure, wavelength, cent
     k0_tilted = apply_orientation_tilt(np.array([0, 0, 1]), alpha, beta)
 
 
-    allowed = generate_allowed_reflections(structure, d_min=0.001, hkl_limit=8)
+    allowed = generate_allowed_reflections(structure, d_min=0.01, hkl_limit=8)
     bragg = identify_bragg_reflections(allowed, wavelength, beam_direction=k0_tilted)
     exit_waves = compute_exit_wavevectors(bragg, wavelength, beam_direction=k0_tilted)
     projected = gnomonic_projection(exit_waves, proj_plane_normal=[0, 0, 1])
@@ -604,7 +604,7 @@ def compute_lattice_misalignment_error(lattice_params, structure, wavelength, ce
     temp_structure = apply_lattice_to_structure(structure, a, b, c, alpha, beta, gamma)
 
 
-    allowed = generate_allowed_reflections(temp_structure, d_min=0.001, hkl_limit=8)
+    allowed = generate_allowed_reflections(temp_structure, d_min=0.01, hkl_limit=8)
     bragg = identify_bragg_reflections(allowed, wavelength, beam_direction=k0_tilted)
     exit_waves = compute_exit_wavevectors(bragg, wavelength, beam_direction=k0_tilted)
     projected = gnomonic_projection(exit_waves, proj_plane_normal=[0, 0, 1])
@@ -631,9 +631,9 @@ def refine_lattice_parameters(structure, wavelength, centroid_frames, frame_step
     init_params = [lat.a, lat.b, lat.c, lat.alpha, lat.beta, lat.gamma]
 
     bounds = [
-        (0.9 * lat.a, 1.1 * lat.a),
-        (0.9 * lat.b, 1.1 * lat.b),
-        (0.9 * lat.c, 1.1 * lat.c),
+        (5.3, 5.6),  # a
+        (5.3, 5.6),  # b
+        (5.3, 5.6),  # c
         (85, 95),  # alpha
         (85, 95),  # beta
         (85, 95)   # gamma
@@ -682,8 +682,128 @@ refined_params = refine_lattice_parameters(
     k0_tilted
 )
 
+
+import matplotlib.pyplot as plt
+
+def generate_projected_data(structure, wavelength, frame_step, centroid_frames, alpha_deg=0.0, beta_deg=0.0, lattice_params=None):
+    """
+    Helper to compute projected 2D reflection data from given structure and orientation.
+    """
+    k0 = apply_orientation_tilt([0, 0, 1], alpha_deg, beta_deg)
+
+    if lattice_params is not None:  
+        structure = apply_lattice_to_structure(structure, *lattice_params)
+
+    reflections = generate_allowed_reflections(structure, d_min=0.01, hkl_limit=8)
+    bragg = identify_bragg_reflections(reflections, wavelength, beam_direction=k0)
+    exit_waves = compute_exit_wavevectors(bragg, wavelength, beam_direction=k0)
+    projected = gnomonic_projection(exit_waves, proj_plane_normal=[0, 0, 1])
+
+    return projected
+
+
+
+def plot_final_comparison(
+    original_structure,
+    wavelength,
+    frame_step,
+    centroid_frames,
+    refined_alpha,
+    refined_beta,
+    refined_lattice_params,
+    title="Beam Diagram Comparison"
+):
+    """
+    Create side-by-side plot of initial vs refined beam diagrams.
+    """
+    fig, axes = plt.subplots(1, 2, figsize=(14, 6), sharey=True)
+    axes = axes.flatten()
+
+    def plot_panel(ax, projected, label):
+        ax.set_facecolor('black')
+        ax.set_title(label, fontsize=12)
+        x_vals = [frame_step * f for f in centroid_frames.values()]
+        ax.plot(
+            [min(x_vals), max(x_vals)],
+            [0, 0],
+            color='red', linewidth=1.5
+        )
+
+        for refl in projected:
+            hkl = refl['hkl']
+            if hkl in centroid_frames:
+                x = centroid_frames[hkl] * frame_step
+                y = refl['projected_2d'][1]
+                ax.plot(x, y, 'w.', alpha=0.6)
+                ax.plot(x, 0, 'o', color='yellow', markersize=2)
+
+        # Only plot blue lines for matched reflections
+        matched_hkls = {refl['hkl'] for refl in projected if refl['hkl'] in centroid_frames}
+        for hkl in matched_hkls:
+            ax.axvline(centroid_frames[hkl] * frame_step, color='blue', linewidth=0.3, alpha=0.4)
+
+        ax.set_xlabel("Frame × step (deg)")
+        ax.set_xlim(min(x_vals), max(x_vals))
+
+    # Compute both geometries
+    projected_initial = generate_projected_data(
+        original_structure, wavelength, frame_step, centroid_frames
+    )
+    projected_refined = generate_projected_data(
+        original_structure, wavelength, frame_step, centroid_frames,
+        alpha_deg=refined_alpha, beta_deg=refined_beta,
+        lattice_params=refined_lattice_params
+    )
+
+    plot_panel(axes[0], projected_initial, "Initial Geometry")
+    plot_panel(axes[1], projected_refined, "Refined Geometry")
+
+    fig.suptitle(title, fontsize=14)
+    axes[0].set_ylabel("Reciprocal space projection (arb. units)")
+    plt.tight_layout()
+    plt.show()
+
+
+structure = CifParser("silicon_structure.cif").get_structures()[0]
+wavelength = 0.02508
+dyn_data = parse_dyn_cif_manual("Si_3_dyn.cif_pets")
+centroid_frames = dyn_data['centroid_frames']
+frame_step = dyn_data['frame_step']
+
+# --- Step 1: Refine α and β tilt
+alpha, beta = refine_orientation(
+    structure,
+    wavelength,
+    centroid_frames,
+    frame_step
+)
+
+# --- Step 2: Compute beam direction using α, β
+k0_tilted = apply_orientation_tilt([0, 0, 1], alpha, beta)
+
+# --- Step 3: Refine lattice using the beam direction
+refined_lattice = refine_lattice_parameters(
+    structure,
+    wavelength,
+    centroid_frames,
+    frame_step,
+    k0_tilted
+)
+
+# --- Step 4: Plot the final comparison using actual results
+plot_final_comparison(
+    original_structure=structure,
+    wavelength=wavelength,
+    frame_step=frame_step,
+    centroid_frames=centroid_frames,
+    refined_alpha=alpha,
+    refined_beta=beta,
+    refined_lattice_params=refined_lattice
+)
+
 print("\n=== Final Refinement Results ===")
 print(f"Beam orientation tilt: α = {alpha_deg:.4f}°, β = {beta_deg:.4f}°")
 print(f"Lattice parameters: a = {refined_params[0]:.4f}, b = {refined_params[1]:.4f}, "
       f"c = {refined_params[2]:.4f}, α = {refined_params[3]:.2f}, β = {refined_params[4]:.2f}, γ = {refined_params[5]:.2f}")
 print("Refined unit cell volume:", Lattice.from_parameters(*refined_params).volume)
+
