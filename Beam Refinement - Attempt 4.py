@@ -384,12 +384,12 @@ def _plot_results(results: List[Dict], out_png: str):
     fig, axes = plt.subplots(2, 1, figsize=(10,8), sharex=True)
     ax0, ax1 = axes
 
-    ax0.plot(zone_ids, da_deg, marker='o', linestyle='-', label=r'$\Delta \alpha$ (deg)')
+    ax0.plot(zone_ids, da_deg, marker='o', linestyle='-', markersize=1, label=r'$\Delta \alpha$ (deg)')
     ax0.set_ylabel(r'$\Delta \alpha$ (deg)')
     ax0.grid(True)
     ax0.legend()
 
-    ax1.plot(zone_ids, db_deg, marker='o', linestyle='-', label=r'$\Delta \beta$ (deg)', color='tab:orange')
+    ax1.plot(zone_ids, db_deg, marker='o', linestyle='-', markersize=1, label=r'$\Delta \beta$ (deg)', color='tab:orange')
     ax1.set_ylabel(r'$\Delta \beta$ (deg)')
     ax1.set_xlabel('Zone axis / frame index')
     ax1.grid(True)
