@@ -1,6 +1,4 @@
 """
-wobble_refiner_cifpets.py
-
 Per-frame alpha/beta wobble refinement for Si_3_dyn.cif_pets.
 Paste into Spyder and run locally.
 
