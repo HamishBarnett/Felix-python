@@ -11,6 +11,7 @@ from __future__ import annotations
 import math
 import numpy as np
 import matplotlib.pyplot as plt
+import re
 from typing import Dict, List, Tuple, Optional
 try:
     import gemmi
@@ -162,6 +163,97 @@ def robust_int(x: str) -> int:
     except Exception:
         return 0
 
+def _parse_loop_from_text(cif_path: str, required_tags: List[str]) -> Optional[Dict[str, List[str]]]:
+    """
+    Very simple CIF loop parser for numeric tables.
+    Scans the file for a loop_ that contains all required_tags (any order),
+    then returns a dict[tag] -> list of string values. Handles multi-row lines.
+    """
+    with open(cif_path, 'r', encoding='utf-8', errors='ignore') as fh:
+        lines = fh.readlines()
+
+    i, n = 0, len(lines)
+    while i < n:
+        if lines[i].lstrip().startswith('loop_'):
+            # collect tag lines
+            j = i + 1
+            tags = []
+            while j < n and lines[j].lstrip().startswith('_'):
+                tags.append(lines[j].split()[0].strip())
+                j += 1
+            if not tags:
+                i = j
+                continue
+
+            # if this loop has all required tags, parse its data block
+            if all(t in tags for t in required_tags):
+                tag_to_idx = {t: k for k, t in enumerate(tags)}
+                # collect data lines until next loop_/data_/tag
+                data_tokens = []
+                k = j
+                while k < n:
+                    s = lines[k].strip()
+                    if (not s) or s.startswith('#'):
+                        k += 1
+                        continue
+                    if s.startswith('loop_') or s.startswith('data_') or s.startswith('_'):
+                        break
+                    data_tokens.extend(s.split())
+                    k += 1
+                # split tokens into rows of len(tags)
+                rows = []
+                m = len(tags)
+                p = 0
+                while p + m <= len(data_tokens):
+                    rows.append(data_tokens[p:p+m])
+                    p += m
+                if not rows:
+                    return None
+                # build result dict for just the required tags
+                result = {t: [] for t in required_tags}
+                for row in rows:
+                    for t in required_tags:
+                        result[t].append(row[tag_to_idx[t]])
+                return result
+            i = j
+        else:
+            i += 1
+    return None
+
+def detect_alpha_sense(alphas_deg: np.ndarray,
+                       z_meas: np.ndarray,
+                       x0: np.ndarray,
+                       z0: np.ndarray) -> Tuple[int, float, float]:
+    """
+    Compare modeled alpha_hat from measured z against nominal alphas.
+    Returns (sense, slope, intercept) where sense is +1 (ok) or -1 (flip).
+    """
+    a_hat_deg = np.rad2deg(np.array(
+        [atan2_from_frame(z_meas[i], x0, z0) for i in range(len(z_meas))]
+    ))
+    A = np.vstack([alphas_deg, np.ones_like(alphas_deg)]).T
+    slope, intercept = np.linalg.lstsq(A, a_hat_deg, rcond=None)[0]
+    sense = 1 if slope >= 0 else -1
+    return sense, float(slope), float(intercept)
+
+def orthonormalize_keep_signs(x0: np.ndarray, z0: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Orthonormalize while preserving the signs of x0 and z0 that the caller chose.
+    Projects x0 to be orthogonal to z0, normalizes both, and builds y = x0 × z0.
+    """
+    z = normalize(z0.reshape(3))
+    # project x onto plane perpendicular to z
+    x_tmp = x0.reshape(3) - np.dot(x0, z) * z
+    if np.linalg.norm(x_tmp) < 1e-12:
+        # degenerate case: pick any vector not parallel to z
+        t = np.array([1.0, 0.0, 0.0])
+        if abs(np.dot(t, z)) > 0.9:
+            t = np.array([0.0, 1.0, 0.0])
+        x_tmp = t - np.dot(t, z) * z
+    x = normalize(x_tmp)
+    y = normalize(np.cross(x, z))
+    return x, y, z
+
 
 # -------------------------- CIF parsing (with gemmi) --------------------------
 
@@ -172,43 +264,58 @@ def read_cif_block(path: str) -> gemmi.cif.Block:
     return doc[0]
 
 def extract_unit_cell_and_wavelength(block: gemmi.cif.Block) -> Tuple[gemmi.UnitCell, Optional[float]]:
-    # Unit cell
-    cell = block.get_mmcif_cell()
-    if cell is None:
-        # Fallback manual
-        a = robust_float(block.find_value('_cell_length_a'))
-        b = robust_float(block.find_value('_cell_length_b'))
-        c = robust_float(block.find_value('_cell_length_c'))
-        alpha = robust_float(block.find_value('_cell_angle_alpha'))
-        beta = robust_float(block.find_value('_cell_angle_beta'))
-        gamma = robust_float(block.find_value('_cell_angle_gamma'))
-        if any(map(lambda v: not np.isfinite(v) or v <= 0.0, [a, b, c])) or any(
-                map(lambda v: not np.isfinite(v), [alpha, beta, gamma])):
-            raise RuntimeError("Could not read unit cell from CIF.")
-        unit_cell = gemmi.UnitCell(a, b, c, alpha, beta, gamma)
-    else:
-        unit_cell = cell
+    """
+    Read unit cell from standard CIF tags (_cell_length_* and _cell_angle_*)
+    and wavelength from common diffraction tags. This avoids using
+    block.get_mmcif_cell(), which some gemmi builds don’t have.
+    Also strips crystallographic uncertainty notation like '5.431(2)'.
+    """
+    def get_float_from_tag(tag: str) -> float:
+        s = block.find_value(tag)
+        if not s:
+            return float('nan')
+        # strip e.s.d., e.g. '5.431(2)' -> '5.431'
+        s = re.sub(r'\(.*\)$', '', s.strip())
+        try:
+            return float(s)
+        except Exception:
+            return float('nan')
 
-    # Wavelength (Å)
-    wv_tags = [
+    a = get_float_from_tag('_cell_length_a')
+    b = get_float_from_tag('_cell_length_b')
+    c = get_float_from_tag('_cell_length_c')
+    alpha = get_float_from_tag('_cell_angle_alpha')
+    beta  = get_float_from_tag('_cell_angle_beta')
+    gamma = get_float_from_tag('_cell_angle_gamma')
+
+    if not all(np.isfinite([a, b, c, alpha, beta, gamma])):
+        raise RuntimeError("Could not read unit cell from CIF (_cell_length_* and _cell_angle_* tags).")
+
+    unit_cell = gemmi.UnitCell(a, b, c, alpha, beta, gamma)
+
+    # Wavelength (Å), try several common tags
+    wav = None
+    for tag in [
         '_diffrn_radiation_wavelength',
         '_diffrn_radiation_wavelength_1',
         '_beam_wavelength',
         '_diffrn_source_wavelength',
-        '_diffrn_radiation_wavelength_nm'  # if nm, will convert below
-    ]
-    wav = None
-    for tag in wv_tags:
+        '_diffrn_radiation_wavelength_nm'  # will convert nm->Å
+    ]:
         val = block.find_value(tag)
-        if val:
-            try:
-                wav = float(val)
-                if tag.endswith('_nm'):
-                    wav *= 10.0  # nm -> Å
-                break
-            except Exception:
-                continue
+        if not val:
+            continue
+        s = re.sub(r'\(.*\)$', '', val.strip())
+        try:
+            wav = float(s)
+            if tag.endswith('_nm'):
+                wav *= 10.0  # nm -> Å
+            break
+        except Exception:
+            continue
+
     return unit_cell, wav
+
 
 def extract_UB_matrix(block: gemmi.cif.Block) -> Optional[np.ndarray]:
     """
@@ -258,72 +365,122 @@ def extract_UB_matrix(block: gemmi.cif.Block) -> Optional[np.ndarray]:
         pass
     return None
 
-def extract_zone_axis_series(block: gemmi.cif.Block) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+def extract_zone_axis_series(block: gemmi.cif.Block,
+                             cif_path: str) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
-    Read zone-axis loop: ids, alpha_deg, z_vectors(u,v,w).
-    Returns (ids:int, alphas_deg:float, z_hat:float[N,3])
+    Read zone-axis loop: ids, alpha_deg, and z_hat from (u,v,w).
+    Tries gemmi APIs first; falls back to plain-text parsing if needed.
     """
-    # Likely loop tags
-    tag_sets = [
-        ('_diffrn_zone_axis_id',
-         '_diffrn_zone_axis_u',
-         '_diffrn_zone_axis_v',
-         '_diffrn_zone_axis_w',
-         '_diffrn_zone_axis_alpha'),
-        # Alternate names (rare)
-        ('_zone_axis_id',
-         '_zone_axis_u', '_zone_axis_v', '_zone_axis_w', '_zone_axis_alpha'),
-    ]
-    loop = None
-    for id_tag, u_tag, v_tag, w_tag, a_tag in tag_sets:
-        try:
-            loop = block.find_loop(id_tag)
-            if loop and all(loop.has_tag(t) for t in [id_tag, u_tag, v_tag, w_tag, a_tag]):
-                ids = [robust_int(x) for x in loop.get_values(id_tag)]
-                u = [robust_float(x) for x in loop.get_values(u_tag)]
-                v = [robust_float(x) for x in loop.get_values(v_tag)]
-                w = [robust_float(x) for x in loop.get_values(w_tag)]
-                a = [robust_float(x) for x in loop.get_values(a_tag)]
-                ids = np.array(ids, dtype=int)
-                alphas_deg = np.array(a, dtype=float)
-                z = np.vstack([u, v, w]).T
-                z = normalize(z)
-                return ids, alphas_deg, z
-        except Exception:
-            continue
-    raise RuntimeError("Could not find a zone-axis loop with (id,u,v,w,alpha) tags in the PETS CIF.")
+    required = ['_diffrn_zone_axis_id',
+                '_diffrn_zone_axis_u',
+                '_diffrn_zone_axis_v',
+                '_diffrn_zone_axis_w',
+                '_diffrn_zone_axis_alpha']
 
-def extract_reflections(block: gemmi.cif.Block) -> Dict[str, np.ndarray]:
+    # --- Try gemmi (find_loop + get_values) ---
+    try:
+        lp = block.find_loop('_diffrn_zone_axis_id')
+        if lp is not None:
+            tags = [str(t) for t in getattr(lp, 'tags', [])]
+            # If 'tags' isn’t exposed, we’ll still try get_values directly.
+            def vals(tag):
+                try:
+                    return lp.get_values(tag)
+                except Exception:
+                    # Fallback if get_values not present
+                    if tags and tag in tags:
+                        j = tags.index(tag)
+                        return [row[j] for row in lp]
+                    raise
+
+            ids = [robust_int(x) for x in vals('_diffrn_zone_axis_id')]
+            u   = [robust_float(x) for x in vals('_diffrn_zone_axis_u')]
+            v   = [robust_float(x) for x in vals('_diffrn_zone_axis_v')]
+            w   = [robust_float(x) for x in vals('_diffrn_zone_axis_w')]
+            a   = [robust_float(x) for x in vals('_diffrn_zone_axis_alpha')]
+
+            ids = np.array(ids, dtype=int)
+            alphas_deg = np.array(a, dtype=float)
+            z = np.vstack([u, v, w]).T
+            z = normalize(z)
+            return ids, alphas_deg, z
+    except Exception:
+        pass
+
+    # --- Fallback: parse the CIF text directly ---
+    table = _parse_loop_from_text(cif_path, required)
+    if table is None:
+        raise RuntimeError("Could not find a zone-axis loop with tags (id,u,v,w,alpha) in the PETS CIF.")
+
+    ids = np.array([robust_int(x) for x in table['_diffrn_zone_axis_id']], dtype=int)
+    alphas_deg = np.array([robust_float(x) for x in table['_diffrn_zone_axis_alpha']], dtype=float)
+    u = np.array([robust_float(x) for x in table['_diffrn_zone_axis_u']], dtype=float)
+    v = np.array([robust_float(x) for x in table['_diffrn_zone_axis_v']], dtype=float)
+    w = np.array([robust_float(x) for x in table['_diffrn_zone_axis_w']], dtype=float)
+    z = normalize(np.vstack([u, v, w]).T)
+    return ids, alphas_deg, z
+
+def extract_reflections(block: gemmi.cif.Block,
+                        cif_path: str) -> Dict[str, np.ndarray]:
     """
-    Read reflections with h,k,l, intensity (or F^2), sigma (if present), and zone_axis_id (frame id).
-    Returns dict with numpy arrays.
+    Read reflections: h,k,l, intensity (or F^2), sigma, and zone_axis_id.
+    Tries gemmi first; falls back to plain-text parsing. Supports PETS tags.
     """
-    # Common tag variants
-    tag_variants = [
-        ('_refln_index_h', '_refln_index_k', '_refln_index_l',
-         '_refln_intensity', '_refln_intensity_sigma', '_refln_zone_axis_id'),
-        ('_refln_index_h', '_refln_index_k', '_refln_index_l',
-         '_refln_F_squared_meas', '_refln_F_squared_sigma', '_refln_zone_axis_id'),
-        ('_refln_index_h', '_refln_index_k', '_refln_index_l',
-         '_refln_intensity_net', '_refln_intensity_sigma', '_refln_zone_axis_id'),
+    base_tags = ['_refln_index_h', '_refln_index_k', '_refln_index_l', '_refln_zone_axis_id']
+    variants = [
+        ('_refln_intensity_meas', '_refln_intensity_sigma'),
+        ('_refln_intensity',      '_refln_intensity_sigma'),
+        ('_refln_F_squared_meas', '_refln_F_squared_sigma'),
+        ('_refln_intensity_net',  '_refln_intensity_sigma'),
     ]
-    for tags in tag_variants:
-        try:
-            loop = block.find_loop(tags[0])
-            if not loop:
+
+    # --- Try gemmi ---
+    try:
+        # Find a loop that has h,k,l,zone plus any of the intensity/sigma pairs
+        for I_tag, S_tag in variants:
+            lp = block.find_loop('_refln_index_h')
+            if lp is None:
                 continue
-            if not all(loop.has_tag(t) for t in tags):
+            tags = [str(t) for t in getattr(lp, 'tags', [])]
+            if not all(t in tags for t in base_tags + [I_tag, S_tag]):
+                # Some PETS exports split reflections across loops; try text fallback later
                 continue
-            h = np.array([robust_int(x) for x in loop.get_values(tags[0])], dtype=int)
-            k = np.array([robust_int(x) for x in loop.get_values(tags[1])], dtype=int)
-            l = np.array([robust_int(x) for x in loop.get_values(tags[2])], dtype=int)
-            I = np.array([robust_float(x) for x in loop.get_values(tags[3])], dtype=float)
-            sig = np.array([robust_float(x) for x in loop.get_values(tags[4])], dtype=float)
-            zid = np.array([robust_int(x) for x in loop.get_values(tags[5])], dtype=int)
-            return {'h': h, 'k': k, 'l': l, 'I': I, 'sigma': sig, 'zone_id': zid}
-        except Exception:
-            continue
-    raise RuntimeError("Could not find a reflections loop with (h,k,l,intensity,sigma,zone_id).")
+
+            def vals(tag):
+                try:
+                    return lp.get_values(tag)
+                except Exception:
+                    if tags and tag in tags:
+                        j = tags.index(tag)
+                        return [row[j] for row in lp]
+                    raise
+
+            H = np.array([robust_int(x) for x in vals('_refln_index_h')], dtype=int)
+            K = np.array([robust_int(x) for x in vals('_refln_index_k')], dtype=int)
+            L = np.array([robust_int(x) for x in vals('_refln_index_l')], dtype=int)
+            Z = np.array([robust_int(x) for x in vals('_refln_zone_axis_id')], dtype=int)
+            I = np.array([robust_float(x) for x in vals(I_tag)], dtype=float)
+            S = np.array([robust_float(x) for x in vals(S_tag)], dtype=float)
+
+            return {'h': H, 'k': K, 'l': L, 'I': I, 'sigma': S, 'zone_id': Z}
+    except Exception:
+        pass
+
+    # --- Fallback: parse the CIF text directly ---
+    # Find the first loop that contains base_tags plus one of the intensity/sigma pairs
+    for I_tag, S_tag in variants:
+        req = base_tags + [I_tag, S_tag]
+        table = _parse_loop_from_text(cif_path, req)
+        if table is not None:
+            H = np.array([robust_int(x) for x in table['_refln_index_h']], dtype=int)
+            K = np.array([robust_int(x) for x in table['_refln_index_k']], dtype=int)
+            L = np.array([robust_int(x) for x in table['_refln_index_l']], dtype=int)
+            Z = np.array([robust_int(x) for x in table['_refln_zone_axis_id']], dtype=int)
+            I = np.array([robust_float(x) for x in table[I_tag]], dtype=float)
+            S = np.array([robust_float(x) for x in table[S_tag]], dtype=float)
+            return {'h': H, 'k': K, 'l': L, 'I': I, 'sigma': S, 'zone_id': Z}
+
+    raise RuntimeError("Could not find a reflections loop with h,k,l,intensity,sigma,zone_id tags.")
 
 
 # -------------------------- Core analysis functions --------------------------
@@ -332,12 +489,31 @@ def fit_initial_frame_from_zone_axis(alphas_deg: np.ndarray,
                                      z_meas: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray, float]:
     """
     Fit z(alpha) ≈ z0 cos a + x0 sin a, then orthonormalize to get (x0, y, z0).
-    Returns (x0, y, z0, rms_residual)
+    Disambiguate signs so that z·x0 ~ +sin(a) and z·z0 ~ +cos(a).
+    Crucially, preserve the chosen signs during orthonormalization.
     """
     a_rad = deg2rad(alphas_deg)
-    x0_guess, z0_guess, rms = solve_z0_x0_by_lstsq(a_rad, z_meas)
-    x0, y, z0 = gram_schmidt_frame(x0_guess, z0_guess)
+
+    # Linear LSQ to get raw x0,z0
+    x0_raw, z0_raw, rms = solve_z0_x0_by_lstsq(a_rad, z_meas)
+
+    # Initial orthonormalization (no sign enforcement yet)
+    x0_hat, y_hat, z0_hat = orthonormalize_keep_signs(x0_raw, z0_raw)
+
+    # --- Sign disambiguation using the data ---
+    sin_a = np.sin(a_rad)
+    cos_a = np.cos(a_rad)
+    proj_x = np.einsum('ij,j->i', z_meas, x0_hat)  # z·x0 across frames
+    proj_z = np.einsum('ij,j->i', z_meas, z0_hat)  # z·z0 across frames
+
+    s_x = 1.0 if np.sum(proj_x * sin_a) >= 0.0 else -1.0
+    s_z = 1.0 if np.sum(proj_z * cos_a) >= 0.0 else -1.0
+
+    # Apply chosen signs and RE-orthonormalize while KEEPING those signs
+    x0, y, z0 = orthonormalize_keep_signs(s_x * x0_hat, s_z * z0_hat)
+
     return x0, y, z0, rms
+
 
 def compute_deviation_series(alphas_deg: np.ndarray,
                              z_meas: np.ndarray,
@@ -447,11 +623,18 @@ def compute_phi_list(records: List[Dict],
 def sliding_window_svd_six_components(phi_list: List[Dict],
                                       window_size: int = 24,
                                       step: int = 6,
-                                      weight_by_intensity: bool = True) -> List[Dict]:
+                                      weight_by_intensity: bool = True,
+                                      ref_frame: Optional[Tuple[np.ndarray, np.ndarray, np.ndarray]] = None,
+                                      cond_max: Optional[float] = None) -> List[Dict]:
     """
     Build the linear system for consecutive subsets of reflections:
     [ n cos(alpha-phi) | n sin(alpha-phi) ] · [z0; x0] = 0
-    Solve by SVD nullspace. Return list of dicts with alpha_center_deg, z0_vec, x0_vec, y_vec, cond, n_rows.
+    Solve by SVD nullspace.
+
+    NEW:
+      - ref_frame=(x0_ref, y_ref, z0_ref): align each window’s (x0,z0,y) to the global frame
+        to remove arbitrary ± sign flips.
+      - cond_max: if set, skip windows whose conditioning indicator exceeds this value.
     """
     if len(phi_list) < 6:
         return []
@@ -473,27 +656,52 @@ def sliding_window_svd_six_components(phi_list: List[Dict],
         n_sub = nvecs[mask]        # (m,3)
         a_sub = alphas_deg[mask]   # (m,)
         p_sub = phis[mask]         # (m,)
+        w_sub = intens[mask] if weight_by_intensity else None
         m = len(a_sub)
+
         if m >= 6:
             ca = np.cos(deg2rad(a_sub) - p_sub)
             sa = np.sin(deg2rad(a_sub) - p_sub)
             # Build A: (m x 6); row i: [n_i * ca_i | n_i * sa_i]
             A = np.hstack([n_sub * ca[:, None], n_sub * sa[:, None]])
-            w = intens[mask] if weight_by_intensity else None
 
-            v = svd_null_vector(A, w)
+            v = svd_null_vector(A, w_sub)
             z0_raw = v[:3]
             x0_raw = v[3:]
-            # Orthonormalize to get right-handed frame
+
+            # Orthonormalize
             x0, y, z0 = gram_schmidt_frame(x0_raw, z0_raw)
-            # condition indicator = ratio of smallest to second-smallest singular values
-            # (smaller means better-defined nullspace); compute quickly
-            if w is not None:
-                Aw = (A.T * np.sqrt(np.clip(w, 1e-12, None))).T
+
+            # Compute conditioning indicator
+            if w_sub is not None:
+                Aw = (A.T * np.sqrt(np.clip(w_sub, 1e-12, None))).T
                 S = np.linalg.svd(Aw, compute_uv=False)
             else:
                 S = np.linalg.svd(A, compute_uv=False)
             cond = float(S[-1] / S[-2]) if len(S) >= 2 and S[-2] > 0 else float('nan')
+
+            # Optionally skip poorly-conditioned windows
+            if cond_max is not None and np.isfinite(cond) and cond > cond_max:
+                idx += step
+                continue
+
+            # ---- ALIGN TO GLOBAL FRAME (removes ± sign flips) ----
+            if ref_frame is not None:
+                x_ref, y_ref, z_ref = ref_frame
+
+                # 1) Global ± ambiguity: flip both if z is opposite to reference
+                if np.dot(z0, z_ref) < 0:
+                    z0 = -z0
+                    x0 = -x0
+                # 2) Ensure y has consistent sign with reference
+                y = normalize(np.cross(x0, z0))
+                if np.dot(y, y_ref) < 0:
+                    x0 = -x0
+                    y = -y
+                # (Optional) bring x closer to its reference if still opposite
+                if np.dot(x0, x_ref) < 0:
+                    x0 = -x0
+                    y = -y  # keep right-handedness
 
             out.append({
                 'alpha_center_deg': float(np.mean(a_sub)),
@@ -503,9 +711,11 @@ def sliding_window_svd_six_components(phi_list: List[Dict],
                 'n_rows': int(m),
                 'cond': cond
             })
+
         idx += step
 
     return out
+
 
 def save_six_components_csv(series: List[Dict], path: str) -> None:
     headers = ['alpha_center_deg',
@@ -559,10 +769,10 @@ def run_pipeline(pets_cif_path: str,
         raise RuntimeError("Could not find UB matrix in PETS CIF; required to compute plane normals.")
 
     # Zone-axis series
-    frame_ids, alphas_deg, z_meas = extract_zone_axis_series(pets_block)
+    frame_ids, alphas_deg, z_meas = extract_zone_axis_series(pets_block, pets_cif_path)
 
     # Reflections
-    refl = extract_reflections(pets_block)
+    refl = extract_reflections(pets_block, pets_cif_path)
 
     # (Optional) Reference CIF unit cell for cross-check; we'll keep PETS cell for θ
     ref_cell = None
@@ -576,9 +786,25 @@ def run_pipeline(pets_cif_path: str,
     # Fit initial frame from measured z(alpha)
     x0, y, z0, rms = fit_initial_frame_from_zone_axis(alphas_deg, z_meas)
 
+    # Detect if nominal alpha runs in the opposite sense; if so, flip and refit
+    sense, slope, intercept = detect_alpha_sense(alphas_deg, z_meas, x0, z0)
+    if sense < 0:
+        print(f"Note: detected opposite alpha sense (slope≈{slope:.3f}). Flipping α and refitting.")
+        alphas_deg = -alphas_deg
+        x0, y, z0, rms = fit_initial_frame_from_zone_axis(alphas_deg, z_meas)
+
     # Deviation series
     delta_alpha_deg, beta_deg = compute_deviation_series(alphas_deg, z_meas, x0, y, z0)
     plot_deviation_series(alphas_deg, delta_alpha_deg, beta_deg, out_png=out_png_path)
+
+    print("Δα stats: mean = {:.3e} deg, std = {:.3e} deg, 95% = [{:.3e}, {:.3e}]".format(
+        np.mean(delta_alpha_deg), np.std(delta_alpha_deg),
+        *np.percentile(delta_alpha_deg, [2.5, 97.5])
+    ))
+    print("β stats:  mean = {:.3e} deg, std = {:.3e} deg, 95% = [{:.3e}, {:.3e}]".format(
+        np.mean(beta_deg), np.std(beta_deg),
+        *np.percentile(beta_deg, [2.5, 97.5])
+    ))
 
     # Build alpha_hkl for each plane
     records = build_hkl_alpha_records(refl, frame_ids, alphas_deg,
@@ -589,10 +815,15 @@ def run_pipeline(pets_cif_path: str,
     phi_list = compute_phi_list(records, UB, unit_cell_pets, wavelength, x0, y, z0)
 
     # Sliding-window SVD to get six components along rotation series
-    six_series = sliding_window_svd_six_components(phi_list,
-                                                   window_size=window_size,
-                                                   step=window_step,
-                                                   weight_by_intensity=weight_by_intensity)
+    six_series = sliding_window_svd_six_components(
+        phi_list,
+        window_size=window_size,
+        step=window_step,
+        weight_by_intensity=weight_by_intensity,
+        ref_frame=(x0, y, z0),       # align per-window frames to global
+        cond_max=0.80                # skip poorly-conditioned windows (tune as desired)
+    )
+
     # Save CSV
     save_six_components_csv(six_series, out_csv_path)
 
@@ -615,12 +846,12 @@ def run_pipeline(pets_cif_path: str,
 
 if __name__ == '__main__':
     # Update these paths as needed in your environment (defaults to your uploaded filenames)
-    PETS_CIF_PATH = r'/mnt/data/Si_3_dyn.cif_pets'
-    REF_CIF_PATH = r'/mnt/data/silicon_structure.cif'  # optional but useful
+    PETS_CIF_PATH = r'C:\Users\Hamis\Documents\GitHub\Felix-python/Si_3_dyn.cif_pets'
+    REF_CIF_PATH = r'C:\Users\Hamis\Documents\GitHub\Felix-python/silicon_structure.cif'  # optional but useful
 
     # Tunable parameters
     MIN_SNR_REFLECTIONS = 0.0     # e.g., 2.0 to filter weak reflections
-    WINDOW_SIZE = 24              # number of reflections per SVD window (>=6)
+    WINDOW_SIZE = 100              # number of reflections per SVD window (>=6)
     WINDOW_STEP = 6               # stride between windows
     WEIGHT_BY_INTENSITY = True    # weight equations by summed intensity
     OUT_CSV = 'z0_x0_six_components_series.csv'
