@@ -27,6 +27,8 @@ from typing import Dict, Optional, Tuple, List
 
 import numpy as np
 import pandas as pd
+from datetime import datetime
+import time
 
 # --- External dependencies ---
 from scipy.optimize import least_squares  # robust nonlinear least squares
@@ -524,6 +526,12 @@ def main(
     """
     Stage 6 optimisation end-to-end. Produces an NPZ you can load in Stage 7 for plotting.
     """
+    
+    # ---- Timers: overall Stage 6 run ----
+    wall_start = datetime.now()
+    t0 = time.perf_counter()
+    print(f"\n[Stage 6] Start: {wall_start.isoformat(timespec='seconds')}")
+    
     # ---- Build problem ----
     problem, meta, B, R0_init, reflections_df, zone_axes_df = build_problem_from_files(
         experiment_path=experiment_path,
@@ -598,6 +606,11 @@ def main(
     print(f"  δα: mean={np.mean(da_zone): .6f}°, std={np.std(da_zone): .6f}°, min={np.min(da_zone): .6f}°, max={np.max(da_zone): .6f}°")
     print(f"  β : mean={np.mean(be_zone): .6f}°, std={np.std(be_zone): .6f}°, min={np.min(be_zone): .6f}°, max={np.max(be_zone): .6f}°")
 
+    # ---- Timing summary ----
+    elapsed = time.perf_counter() - t0
+    wall_end = datetime.now()
+    print(f"[Stage 6] End:   {wall_end.isoformat(timespec='seconds')}")
+    print(f"[Stage 6] Elapsed: {elapsed:.2f} s ({elapsed/60:.2f} min)")
 
 # -------------------------------- Entrypoint ---------------------------------
 
@@ -605,20 +618,20 @@ if __name__ == "__main__":
     main(
         experiment_path="Si_3_dyn.cif_pets",
         cif_path="silicon_structure.cif",
-        basis_type="fourier",
-        fourier_harmonics_da=8,
-        fourier_harmonics_beta=8,
+        basis_type="spline",
+        fourier_harmonics_da=15,
+        fourier_harmonics_beta=15,
         # Keep only strong reflections to speed up:
         strength_metric="snr",          # 'snr' or 'intensity'
-        min_strength=5,              # keeps SNR ≥ [x] or min intensity of x (choose strength_metric using line above)
-        top_strength_percent=20,      # then keep top [x%] of those limited by min_strength
+        min_strength=10,              # keeps SNR ≥ [x] or min intensity of x (choose strength_metric using line above)
+        top_strength_percent=5,      # then keep top [x%] of those limited by min_strength
         max_reflections_fit=None,       # optionally also cap, e.g., 50000
         use_precession=None,
-        n_azim_samples=12,
+        n_azim_samples=30,
         # Hyperparameters:
-        mu_zone=1.0,                   # Zone-axis weight - higher value gives graeter weight to reflection data
-        lambda_da_smooth=1e-4,
-        lambda_beta_smooth=1e-4,
+        mu_zone=0.5,                   # Zone-axis weight - higher value gives graeter weight to reflection data
+        lambda_da_smooth=1e-5,
+        lambda_beta_smooth=1e-5,
         lambda_da_mean0=1e-3,
         lambda_beta_mag=1e-4,
         robust_loss="soft_l1",
